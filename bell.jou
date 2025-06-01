@@ -1,0 +1,62 @@
+; 读取gmsh生成的.bdf网格文件
+; e.g. /file/import/nastran/bulkdata F:/Nozzle/OpenFOAM/bell.bdf y
+/file/import/nastran/bulkdata {ROOTPATH}/bell.bdf y
+
+; 求解器和材料属性设置
+/define/models/solver/pressure-based y
+/define/models/steady y
+/define/models/axisymmetric y
+/define/models/energy y , , , ,
+/define/models/viscous/kw-sst y
+; e.g. /define/materials/change-create air , y ideal-gas y constant 2837.76 y constant 0.242 y sutherland , , , , y 20.9 n n
+/define/materials/change-create air , y ideal-gas y constant {Cp} y constant {K} y sutherland , , , , y {M} n n
+
+; 边界重命名
+/define/boundary-conditions/list-zones/
+/define/boundary-conditions/zone-type solid-1 fluid
+/define/boundary-conditions/zone-name wall-2 wall
+/define/boundary-conditions/zone-name wall-3 inlet
+/define/boundary-conditions/zone-name wall-4 axis
+/define/boundary-conditions/zone-name wall-5 outlet
+/define/boundary-conditions/zone-type inlet pressure-inlet
+/define/boundary-conditions/zone-type axis axis
+/define/boundary-conditions/zone-type outlet pressure-outlet
+/define/boundary-conditions/list-zones/
+
+; 边界条件设置
+; e.g. /define/boundary-conditions/set/pressure-inlet/inlet () p0 n 5e6 supersonic-or-initial-gauge-pressure n 3e6 t0 n 300 q
+/define/boundary-conditions/set/pressure-inlet/inlet () p0 n "{inlet_p}[Pa] - {atmo_p}[Pa]" supersonic-or-initial-gauge-pressure n 3e6 t0 n {inlet_t} q
+/define/boundary-conditions/set/pressure-outlet/outlet () gauge-pressure n 0 q
+; e.g. /define/operating-conditions/operating-pressure 101325
+/define/operating-conditions/operating-pressure {atmo_p}
+
+; Coupled求解方案
+/solve/set/p-v-coupling 24
+; 定义报告和报告文件：质量守恒和推力
+/solve/report-definitions/add report-def-massflow flux-massflow zone-names inlet () q
+/define/named-expressions/add continuity definition "MassFlow(['inlet','outlet']) / {report-def-massflow}" q
+/solve/report-definitions/add report-def-continuity single-val-expression define "continuity" q
+; 使用Fluent面积平均量来计算推力（相比cfdpost误差~0.1%）
+; e.g. /define/named-expressions/add thrust definition "0.38079764[m^2] * AreaAve(StaticPressure, ['inlet']) + {report-def-massflow} * AreaAve(Velocity.x, ['inlet']) - dot(Force(['wall']), vector(1,0,0))" q
+/define/named-expressions/add thrust definition "{inlet_area}[m^2] * AreaAve(StaticPressure, ['inlet']) + {report-def-massflow} * AreaAve(Velocity.x, ['inlet']) - dot(Force(['wall']), vector(1,0,0))" q
+/solve/report-definitions/add report-def-thrust single-val-expression define "thrust" q
+/solve/report-files/add report-def-0 report-defs report-def-continuity report-def-massflow report-def-thrust () file-name "report-def-0-rfile.out" frequency 10 q
+
+; 求解并保存结果
+/file/auto-save/root-name SYS
+/solve/initialize/hyb-initialization y
+/file/auto-save/data-frequency 400
+/solve/monitors/residual/convergence-criteria 1e-5 1e-5 1e-5 1e-8 1e-5 1e-5
+/solve/set/ri 1
+/file/write-case-data/bellNozzle.cas.h5 y
+/solve/iterate 2000 n y
+; 创建马赫数云图（fluent的batch模式下不可用）
+; /display/objects/create contour contour-mach field mach-number q
+; /display/set/mirror-zones axis ()
+; /display/objects/display contour-mach
+; /display/views/auto-scale
+; /display/set/picture/use-window-resolution n
+; /display/save-picture "mach" y
+/file/write-case-data/bellNozzle-end.cas.h5 y
+exit
+yes
