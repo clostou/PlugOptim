@@ -12,7 +12,7 @@ from ML.torch.utils import all_seed
 from environment import PlugSplineEnv, PlugSplineSurrEnv
 from agent import AgentConfig, PPO2, pretrain_sensor
 
-# TODO: 使用全部历史训练数据构建代理模型，替换PlugSplineEnv的耗时CFD计算
+# TODO: 使用全部历史训练数据构建代理模型，替换PlugSplineEnv的耗时CFD计算 ✔
 # TODO: 智能体学习过慢，可能存在知识遗忘的问题
 
 
