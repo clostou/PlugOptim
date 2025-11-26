@@ -16,17 +16,28 @@ if __name__ == '__main__':
             pd.read_excel(r".\plug_result_mesh.xlsx", sheet_name='1200'),
             pd.read_excel(r".\plug_result_mesh.xlsx", sheet_name='1400'),
             pd.read_excel(r".\plug_result_mesh.xlsx", sheet_name='1800')]
-    mesh_n = np.array([0.522, 1.95, 4.36, 7.47, 17.0, 29.4, 67.3, 117, 181, 262, 357, 470])
+    mesh_n = np.array([0.522, 1.95, 4.36, 7.47, 17.0, 29.4, 67.3, 117, 181, 262, 357, 470])[: 10]
     column = ['index', 'report-def-massflow', 'report-def-thrust', 'Cf', 'SpecImpulse']
 
     valid_row = np.all([(np.abs(sheet['report-def-continuity']) < 1e-3).to_list() for sheet in data], axis=0)
-    data_selected = np.array([sheet[valid_row][column] for sheet in data])
+    data_selected = np.array([sheet[valid_row][column] for sheet in data])[: 10]
     fig, ax = plt.subplots()
     ax.plot(mesh_n, data_selected[:, 0, 3], 'k-', linewidth=1.5)
     ax.scatter(mesh_n, data_selected[:, 0, 3], s=50, linewidths=1.2,
                edgecolors='k', facecolors='none', marker='o')
     ax.set_xlabel('$n_{mesh}$ / w')
     ax.set_ylabel('$C_f$')
+    fig.tight_layout()
+    fig.show()
+
+    data = pd.read_excel(r".\plug_result_mesh.xlsx", sheet_name='compare').to_numpy()
+    label = ['$4.4w$', '$17w$', '$67w$', '$262w$']
+    fig, ax = plt.subplots()
+    for i in range(4):
+        ax.plot(data[:, i], '.-', linewidth=1.5, label=label[i])
+    ax.set_xlabel('$case_i$')
+    ax.set_ylabel('$C_f$')
+    ax.legend()
     fig.tight_layout()
     fig.show()
 

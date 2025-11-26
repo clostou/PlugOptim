@@ -43,7 +43,6 @@
 /solve/report-definitions/add report-def-thrust single-val-expression define "thrust" q
 /solve/report-files/add report-def-0 report-defs report-def-continuity report-def-massflow report-def-thrust () file-name "report-def-0-rfile.out" frequency 10 q
 
-
 ; 求解并保存结果
 /file/auto-save/root-name SYS
 /solve/initialize/hyb-initialization y
@@ -59,6 +58,10 @@
 ; /display/views/auto-scale
 ; /display/set/picture/use-window-resolution n
 ; /display/save-picture "mach" y
+; 保存塞锥壁面上的静压和马赫数分布
+/plot/plot y "xy-plot-ycoord.txt" y n n y-coordinate y 1 0 plug ()
+/plot/plot y "xy-plot-pressure.txt" y n n pressure y 1 0 plug ()
+/plot/plot y "xy-plot-mach.txt" y n n mach-number y 1 0 plug ()
 /file/write-case-data/plugNozzle-end.cas.h5 y
 exit
 yes

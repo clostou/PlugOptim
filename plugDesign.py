@@ -56,6 +56,13 @@ class External:
         return (a * (1 + b * Ma ** 2)) ** c / Ma
 
     @staticmethod
+    def _Ma2NPR(Ma, gamma=1.4):
+        """由喷管出口设计马赫数计算喷管工作压力比，即落压比NPR，基于一维等熵流"""
+        a = (gamma - 1) / 2
+        b = gamma / (gamma - 1)
+        return (1 + a * Ma ** 2) ** b
+
+    @staticmethod
     def _Ma2nu(Ma, gamma=1.4):
         """量热完全气体从声速膨胀至特定马赫数产生的转折角，基于普朗特-迈耶（Prandtl-Meyer, P-M）膨胀波，即稀疏波"""
         a = ((gamma + 1) / (gamma - 1)) ** 0.5
@@ -77,8 +84,12 @@ class External:
         if not isinstance(self.Ma_e, none):
             self.epsilon = self._Ma2epsilon(self.Ma_e, self.gamma)
         elif not isinstance(self.epsilon, none):
-            self.Ma_e = root_scalar(lambda x: self._Ma2epsilon(x, self.gamma) - self.epsilon,
-                                    x0=1., x1=10.).root
+            func = lambda x: self._Ma2epsilon(x, self.gamma) - self.epsilon
+            # 查找根所在的区间
+            x = np.arange(1, 12, dtype=float)
+            y = func(x)
+            ind = np.nonzero((y[: -1] * y[1: ]) < 0)[0][0]
+            self.Ma_e = root_scalar(func, x0=x[ind], x1=x[ind + 1]).root
         else:
             print("One of exit Mach number (Ma_e), expansion ratio (ε) must be set.")
             return
@@ -105,7 +116,7 @@ class External:
             self.R_t = self.R_e - k * self.h_t
         else:
             print("One of throat radius from plug axis (R_t), width of throat gap (h_t), \
-            lip radius from plug axis (R_e),equivalent throat radius (r_t) must be set.")
+            lip radius from plug axis (R_e), equivalent throat radius (r_t) must be set.")
             return
         self._theta = delta - np.pi / 2
         print(f"External plug config:\n\tMa_e = {self.Ma_e:.3f}\n\tepsilon = {self.epsilon:.2f}\n",
@@ -139,7 +150,7 @@ class External:
         # 计算塞锥型面坐标
         if factor:
             # 若指定线网格偏置factor，则根据偏置重构坐标点
-            Ma_i = np.linspace(1, self.Ma_e - 1e-6, 1000)
+            Ma_i = np.linspace(1, self.Ma_e + 1e-6, 1000)
             plug_points = self._Ma2plugXY(Ma_i)
             length = np.sum(np.linalg.norm(plug_points[1: ] - plug_points[: -1], axis=1))
             t = np.convolve(offset_space(0, length, n, factor=factor), np.array([1, -1]), mode='valid')
@@ -147,12 +158,12 @@ class External:
             plug_points = [self._Ma2plugXY(1)]
             for size in t:
                 Ma_i = root_scalar(lambda x: np.linalg.norm(self._Ma2plugXY(x) - plug_points[-1]) - size,
-                                   method='secant', x0=Ma_i, x1=self.Ma_e - 1e-6).root
+                                   method='secant', x0=Ma_i, x1=self.Ma_e + 1e-6).root
                 plug_points.append(self._Ma2plugXY(Ma_i))
             points['plug_div'] = np.vstack(plug_points)
         else:
             # 默认按马赫数等间隔划分（坐标点会呈现先变密再变稀的特征）
-            Ma_i = np.linspace(1, self.Ma_e - 1e-6, n)
+            Ma_i = np.linspace(1, self.Ma_e + 1e-6, n)
             points['plug_div'] = self._Ma2plugXY(Ma_i)
 
         # 根据塞锥扩张段划分获取其他区域尺寸
@@ -194,7 +205,7 @@ class External:
         points['wall_outer'] = np.vstack([t, points['outlet_left'][-1, 1] * np.ones(len(t))]).T
         line = points['wall_outer'][-1] - p_lip
         points['wall_end'] = p_lip + line * offset_space(1, 0, ls_middle / np.linalg.norm(line),
-                                                               factor=ls_small / ls_middle).reshape(-1, 1)
+                                                         factor=ls_small / ls_middle).reshape(-1, 1)
 
         self.profile = points
         self.points = np.vstack([points['wall_outer'][: -1],
@@ -226,6 +237,14 @@ class External:
         tag = dict([(name, [ind_pair[2 * i], ind_pair[2 * i + 1]])
                     for i, name in enumerate(['shell', 'inlet', 'plug', 'axis', 'outlet'])])
         return self.points, tag
+
+    def export_geometry(self, path):
+        with open(path, 'w', encoding='utf-8') as fr:
+            # fr.write('3D = True\n')
+            for tag, line in self.profile.items():
+                # fr.write('# %s\n' % tag)
+                np.savetxt(fr, np.hstack([np.ones((line.shape[0], 1)), line]), fmt=['%d', '%.18e', '%.18e'])
+                fr.write('\n')
 
     def plot(self):
         if isinstance(self.profile, type(None)):
@@ -374,12 +393,15 @@ def transform_points(normalized_points, l=1., h=1., by_prop=False):
 class ExternalSpine(External):
     """基于样条曲线的参数化塞式喷管型面"""
 
-    def __init__(self, r_t, epsilon):
-        super(ExternalSpine, self).__init__(epsilon=epsilon, r_t=r_t)
+    def __init__(self, r_t, epsilon, **kwargs):
+        super(ExternalSpine, self).__init__(epsilon=epsilon, r_t=r_t, **kwargs)
         self.L_max = None    # 塞锥最大长度（即理想塞锥长度）
         self.L = None    # 塞锥长度（喉道至末端）
         self.theta = None    # 喉道速度矢量角
         self.bsp = None    # 喷管扩张段样条曲线
+
+        # 记录样条曲线的单调性
+        self.is_increasing = None
 
     def derive(self):
         pass
@@ -424,11 +446,12 @@ class ExternalSpine(External):
             ),
             _weight=0.8
         )
-        self.bsp.plot()
+        # self.bsp.plot()
         x = np.linspace(0, self.L, n)
         y = self.bsp(x)
-        is_increasing = np.all(y[1:] < y[:-1])  # 判断插值曲线单调性
-        print(is_increasing)
+        self.is_increasing = np.all(y[1:] < y[:-1])  # 判断插值曲线单调性
+        if not self.is_increasing:
+            print("Non-monotonic curve of nozzle expansion section", file=sys.stderr)
         points['plug_div'] = func_space_2d(lambda x: (x, self.bsp(x)), 0, self.L, self.L / n, factor=factor)
         points['plug_div'][:, 0] -= self.h_t * np.cos(_delta)
         '''x = offset_space(0, self.L, n, factor=factor)
@@ -438,7 +461,7 @@ class ExternalSpine(External):
 
         # 根据塞锥扩张段划分获取其他区域尺寸
         ls_small = np.linalg.norm(points['plug_div'][1] - points['plug_div'][0])
-        ls_large = 1.5 * np.linalg.norm(points['plug_div'][-1] - points['plug_div'][-2])
+        ls_large = 1.5 * np.linalg.norm(points['plug_div'][-2] - points['plug_div'][-3])  # func_space_2d最后一个元素的长度不稳定
         ls_middle = 0.8 * ls_small + 0.2 * ls_large
 
         # 计算其余边界
@@ -493,10 +516,28 @@ class ExternalSpine(External):
         print(f"Line division info:\n\tls_small = {ls_small: .3e}\n\tls_middle = {ls_middle: .3e}\n\t",
               f"ls_large = {ls_large:.3e}\n\tn_total = {len(self.points)}", sep='')
 
+    def plot(self):
+        self.bsp.plot()
+        super().plot()
 
-def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_path=None):
+
+def mesh_summary(dim):
+    """统计网格量"""
+    entities = gmsh.model.getEntities()
+    num_node, num_elem = 0, 0
+    for _dim, _tag in entities:
+        if _dim == dim:
+            node_tags, node_coords, node_params = gmsh.model.mesh.getNodes(_dim, _tag)
+            num_node += len(node_tags)
+            elem_types, elem_tags, elem_node_tags = gmsh.model.mesh.getElements(_dim, _tag)
+            num_elem += sum(len(i) for i in elem_tags)
+    print(f"Info    : {dim:d}D Mesh has {num_node:d} nodes and {num_elem:d} elements")
+
+
+def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_path=None, plot=True, verbose=True):
     """使用gmsh创建喷管几何并划分非结构网格"""
     gmsh.initialize()
+    gmsh.option.setNumber('General.Terminal', int(verbose))  # 开启/关闭原生的网格生成信息
     gmsh.clear()
     gmsh.model.add("profile")
     # 创建计算域几何
@@ -534,6 +575,9 @@ def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_pat
                 ind += n
         # 网格生成
         gmsh.model.mesh.generate(3)
+    if not verbose:
+        mesh_summary(2 if planner else 3)
+        gmsh.option.setNumber('General.Terminal', 1)
     if save_path:
         suffix = save_path.split('.')[-1]
         if suffix == 'msh':
@@ -545,10 +589,11 @@ def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_pat
         else:
             pass
         gmsh.write(save_path)
-    try:
-        gmsh.fltk.run()
-    except:
-        pass
+    if plot:
+        try:
+            gmsh.fltk.run()
+        except:
+            print("Unable to create fltk GUI", file=sys.stderr)
     gmsh.finalize()
 
 
@@ -557,6 +602,10 @@ if __name__ == '__main__':
     plug.derive()
     plug.generate(n=150, factor=6)
     '''
+    plug = External(epsilon=1.5625, r_t=1)
+    plug.derive()
+    plug.generate(n=90, factor=None)
+    plug.export_geometry(r'.\plug.txt')
     #profile_test()
     plug = ExternalSpine(epsilon=16, r_t=0.2)
     plug.generate(1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.2, n=300, factor=6)

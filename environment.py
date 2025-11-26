@@ -1,0 +1,1092 @@
+import os
+import sys
+import traceback
+import math
+import time
+from copy import deepcopy
+from collections import deque
+import pyDOE2
+from PIL import Image
+from typing import Union, Tuple, Optional, Sequence
+
+import matplotlib.pyplot as plt
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+import numpy as np
+import pandas as pd
+from scipy.interpolate import interp1d
+from sklearn.manifold import TSNE
+import torch
+from torch.nn.utils.rnn import pad_sequence
+from torch.multiprocessing import set_start_method
+import gym
+
+from thop import profile
+
+sys.path.append('/home/zhuofeng/lgq/python/')
+
+from plugDesign import External, ExternalSpine, profile_to_msh
+from bellDesign import CharacteristicsNozzle
+from agent import AgentConfig, train_dae
+from ML.regress import RLS
+from ML.reduce import PCA
+from cfd_toolbox.submit import *
+from cfd_toolbox.utils import *
+from cfd_toolbox.gasdy import *
+from cfd_toolbox.plot import *
+from denoise import DenoisePhysInStackWrapper, train_net, Plotter, save_net, DenoiseWrapper
+
+
+class DataStruct:
+    """
+    数据结构类
+    """
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class NozzleConfig:
+
+    def __init__(self, **kwargs):
+        self.script_path = r'./'  # Fluent脚本路径
+        self.work_path = r'./'  # 工作路径
+        self.fluent_path = 'fluent'  # fluent求解器路径
+        self.thread_n = 8  # 求解进程数
+
+        if os.name == 'nt':
+            self.work_path = r'F:/Nozzle/OpenFOAM'
+            self.fluent_path = r'E:/Ansys/2022R1/v221/fluent/ntbin/win64/fluent.exe'
+            self.thread_n = 4
+        elif os.name == 'posix':
+            self.work_path = r'/home/zhuofeng/lgq/OpenFOAM/test/Fluent/'
+            self.fluent_path = r'/public/software/ansys_inc211/v211/fluent/bin/fluent'
+            self.thread_n = 16
+        else:
+            print("Unknown OS when auto-configure")
+            pass
+
+        self.jet_type = 'bell'  # 喷管类型（钟形喷管bell/塞式喷管plug/样条塞式喷管plug-sp）
+        self.r_t = 0.2  # 等效喉道半径
+        self.epsilon = 16  # 喷管扩张比
+        self.mesh_n = 20  # 网格划分数
+        self.throat_theta = 40  # 钟形喷管喉道角
+        self.throat_rho = 10 * self.r_t  # 钟形喷管喉道曲率半径
+        self.factor = 3  # 网格偏置系数
+        self.spline_p = [1, 0.3, 0.5, 0.2, 0.1]  # 样条塞式喷管插值点
+
+        self.cfd_params = {  # 仿真材料参数和边界条件
+            'inlet_p': [3e6, 6e6, 12e6, 20e6],
+            'atmo_p': [p + 325 for p in [101e3, 60e3, 36e3, 20e3, 8e3, 0]],
+            'inlet_t': 3500,
+            'Cp': 2837.76,  # 1006.43
+            'K': 0.242,  # 0.0242
+            'M': 20.9e-3,  # 28.966e-3
+        }
+        self.render = True  # 绘制喷管构型
+        self.verbose = False  # 信息打印切换（主要是网格生成的输出）
+
+        self.update(**kwargs)
+
+    def type_assign(self, jet_type):
+        self.jet_type = jet_type
+        if self.jet_type == 'bell':
+            self.mesh_n = 20
+            self.throat_theta = 40
+            self.throat_rho = 10 * self.r_t
+            self.factor = 3
+        elif self.jet_type == 'plug':
+            self.mesh_n = 150
+            self.factor = 6
+        elif self.jet_type == 'plug-sp':
+            self.mesh_n = 350
+            self.factor = 6
+            self.spline_p = [1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.2]
+        else:
+            print("Unknown type of nozzle when auto-configure")
+
+    def update(self, **kwargs):
+        if 'jet_type' in kwargs.keys():
+            self.type_assign(kwargs.pop('jet_type'))
+        if 'cfd_params' in kwargs.keys():
+            self.cfd_params.update(kwargs.pop('cfd_params'))
+        self.__dict__.update(kwargs)
+
+
+class NozzleCFD:
+    """
+    定义了喷管仿真的特定问题，与fluent脚本配合使用
+    """
+
+    def __init__(self, config: NozzleConfig):
+        self.thread = config.thread_n
+        self.plot = config.render
+        self.r_t = config.r_t
+        self.epsilon = config.epsilon
+        self.mesh_n = config.mesh_n
+        self.params = config.cfd_params
+        params_extra = thermo(self.params['Cp'], self.params['M'])
+        self.params.update(params_extra)
+
+        if config.jet_type == 'bell':
+            self.base_path = os.path.join(config.work_path,
+                                          f'bell_Rt{self.r_t:.1e}_eps{self.epsilon:.1f}_n{self.mesh_n:d}')
+            os.makedirs(self.base_path, exist_ok=True)
+            jou_path = os.path.join(self.base_path, 'bell.jou')
+            copy_file(jou_path, os.path.join(config.script_path, 'bell.jou'))
+            with open(os.path.join(self.base_path, 'config.txt'), 'w', encoding='utf-8') as f:  # 写出喷管几何参数
+                f.write(f'{self.r_t:.6e}\n{self.epsilon:.6e}\n')
+            # 计算喷管构型
+            bell = CharacteristicsNozzle(r_t=self.r_t, rho_t=config.throat_rho,
+                                         axial_sym=True, gamma=self.params['gamma'])
+            bell.derive(epsilon=self.epsilon, throat_theta=config.throat_theta)
+            if self.plot:
+                bell.plot_field()
+            # 模型生成及网格划分
+            bell.generate(size=self.r_t / self.mesh_n, factor=config.factor)
+            if self.plot:
+                bell.plot_profile()
+            profile, tag = bell.get_profile()
+            profile_to_msh(profile, tag, lc=0., planner=True, plot=self.plot, verbose=config.verbose,
+                           save_path=os.path.join(self.base_path, 'bell.bdf'))
+            self.A_inlet = np.pi * profile[tag['inlet'][0]][1] ** 2
+            # 创建Fluent任务
+            self.model = bell
+            self.task = FluentQuest(config.fluent_path, os.path.abspath(jou_path),
+                                    planar_geom=True, thread_n=self.thread)
+        elif config.jet_type == 'plug':
+            self.base_path = os.path.join(config.work_path,
+                                          f'plug_Rt{self.r_t:.2e}_eps{self.epsilon:.1f}_n{self.mesh_n:d}')
+            os.makedirs(self.base_path, exist_ok=True)
+            jou_path = os.path.join(self.base_path, 'plug.jou')
+            copy_file(jou_path, os.path.join(config.script_path, 'plug.jou'))
+            with open(os.path.join(self.base_path, 'config.txt'), 'w', encoding='utf-8') as f:  # 写出喷管几何参数
+                f.write(f'{self.r_t:.6e}\n{self.epsilon:.6e}\n')
+            # 计算喷管构型
+            plug = External(epsilon=self.epsilon, r_t=self.r_t, gamma=self.params['gamma'])
+            plug.derive()
+            # 模型生成及网格划分
+            plug.generate(n=self.mesh_n, factor=config.factor)
+            if self.plot:
+                plug.plot()
+            profile, tag = plug.get_profile()
+            profile_to_msh(profile, tag, lc=0., planner=True, plot=self.plot, verbose=config.verbose,
+                           save_path=os.path.join(self.base_path, 'plug.bdf'))
+            self.A_inlet = np.pi * (profile[tag['inlet'][0]][1] ** 2 - profile[tag['inlet'][-1]][1] ** 2)
+            # 创建Fluent任务
+            self.model = plug
+            self.task = FluentQuest(config.fluent_path, os.path.abspath(jou_path),
+                                    planar_geom=True, thread_n=self.thread)
+        elif config.jet_type == 'plug-sp':
+            self.base_path = os.path.join(config.work_path,
+                                          f'plug-sp_Rt{self.r_t:.2e}_eps{self.epsilon:.1f}_n{self.mesh_n:d}_' +
+                                          ''.join(map(lambda x: str(int(x * 1e4)), config.spline_p)))  # 插值参数保留四位有效数字
+            os.makedirs(self.base_path, exist_ok=True)
+            jou_path = os.path.join(self.base_path, 'plug.jou')
+            copy_file(jou_path, os.path.join(config.script_path, 'plug.jou'))
+            with open(os.path.join(self.base_path, 'config.txt'), 'w', encoding='utf-8') as f:  # 写出喷管几何参数
+                f.write(f'{self.r_t:.6e}\n{self.epsilon:.6e}\n')
+                f.write(' '.join(map(lambda x: str(round(x, 6)), config.spline_p)) + '\n')
+            # 计算喷管构型
+            plug = ExternalSpine(epsilon=self.epsilon, r_t=self.r_t, gamma=self.params['gamma'])
+            # 模型生成及网格划分
+            plug.generate(*config.spline_p, n=self.mesh_n, factor=config.factor)
+            if self.plot:
+                plug.plot()
+            profile, tag = plug.get_profile()
+            profile_to_msh(profile, tag, lc=0., planner=True, plot=self.plot, verbose=config.verbose,
+                           save_path=os.path.join(self.base_path, 'plug.bdf'))
+            self.A_inlet = np.pi * (profile[tag['inlet'][0]][1] ** 2 - profile[tag['inlet'][-1]][1] ** 2)
+            # 创建Fluent任务
+            self.model = plug
+            self.task = FluentQuest(config.fluent_path, os.path.abspath(jou_path),
+                                    planar_geom=True, thread_n=self.thread)
+        else:
+            raise ValueError("Unknown type of nozzle. (Supported type: bell, plug, plug-sp)")
+
+        # 需要求解的参数组，注意Fluent内分子量的单位为kg/kmol，非SI
+        self.task.add_params(
+            Cp=[self.params['Cp']], K=[self.params['K']], M=[self.params['M'] * 1e3],
+            inlet_p=self.params['inlet_p'], inlet_t=[self.params['inlet_t']],
+            atmo_p=self.params['atmo_p'], inlet_area=[self.A_inlet])
+        print(self.task)
+
+        self.data = None
+        self.data_field = None
+
+    def postproc(self):
+        # 读取工况和计算结果
+        result_file = os.path.join(self.base_path, 'fluent_result.txt')
+        if not os.path.exists(result_file):
+            if not hasattr(self.task, '_job_dir_list'):
+                for _ in self.task:
+                    pass
+            self.task.get_result('report-def-0-rfile.out')
+            self.task.get_xyplot('xy-plot-ycoord.txt')
+            self.task.get_xyplot('xy-plot-pressure.txt')
+            self.task.get_xyplot('xy-plot-mach.txt')
+        # 计算结果处理
+        with open(result_file, 'r', encoding='utf-8') as fr:
+            header = fr.readline().strip().split(',')
+            data = pd.read_csv(fr, delimiter=' ', index_col=0, names=header)
+        gas_prop = thermo(data['Cp'], data['M'] * 1e-3)
+        data['Qm_max'] = Qm_max(data['inlet_p'], data['inlet_t'], np.pi * self.r_t ** 2,
+                                gas_prop['gamma'], gas_prop['R'])
+        data['Cf'] = data['report-def-thrust'] / (np.pi * self.r_t ** 2 * data['inlet_p'])
+        data['Cf_max'] = Cf_max(data['inlet_p'], data['atmo_p'], gas_prop['gamma'])
+        data['SpecImpulse'] = data['report-def-thrust'] / (9.80665 * data['report-def-massflow'])
+        data.to_csv(os.path.join(self.base_path, 'result.csv'))
+        self.data = data
+        # 读取场变量
+        with open(os.path.join(self.base_path, 'xy-plot-ycoord.txt'), 'r', encoding='utf-8') as fr:
+            arr1 = np.fromfile(fr, dtype=float, sep=' ')  # 这里读出的是一维数组
+            arr1 = arr1.reshape((len(data), 2, -1))
+        with open(os.path.join(self.base_path, 'xy-plot-pressure.txt'), 'r', encoding='utf-8') as fr:
+            arr2 = np.fromfile(fr, dtype=float, sep=' ')  # 这里读出的是一维数组
+            arr2 = arr2.reshape((len(data), 2, -1))
+        with open(os.path.join(self.base_path, 'xy-plot-mach.txt'), 'r', encoding='utf-8') as fr:
+            arr3 = np.fromfile(fr, dtype=float, sep=' ')  # 这里读出的是一维数组
+            arr3 = arr3.reshape((len(data), 2, -1))
+        if (arr1[:, 0, :] != arr2[:, 0, :]).any() or (arr1[:, 0, :] != arr3[:, 0, :]).any():
+            raise ValueError("fluent xy-plot files have different x coordinate. (y-coord/pressure/mach)")
+        data_field = np.concatenate([arr1, arr2[:, 1:2, :], arr3[:, 1:2, :]], axis=1)
+        x, ind = np.unique(data_field[0, 0, :], return_index=True)  # 去除可能存在的重复节点
+        self.data_field = data_field[:, :, ind]
+        print(f"{len(data)} samples and {len(x)} points have been read. (point range: [{x[0]:.3e}, {x[-1]:.3e}])")
+        return data
+
+    def analyse(self):
+        if self.data is None:
+            print("Please run `NozzleCFD.postproc()` to collect data first.")
+            return
+        # NPR为设计工况时Cf的变化
+        try:
+            my_sheet1 = pd.DataFrame()
+            my_sheet1['NPR'] = self.data['inlet_p'] / self.data['atmo_p']
+            NPR_tartget = self.model._Ma2NPR(self.model.Ma_e, self.model.gamma)
+            my_sheet1['ln(NPR/NPR_target)'] = np.log(my_sheet1['NPR'] / NPR_tartget)
+            my_sheet1['Cf/Cf_max'] = self.data['Cf'] / self.data['Cf_max']
+            my_sheet1 = my_sheet1.sort_values(by='NPR', ascending=True)
+        except Exception as e:
+            print("Failed to generate sheet 1:", repr(e), file=sys.stderr)
+            my_sheet1 = None
+        # 收集塞锥喉道处的物理量
+        try:
+            n_sample = len(self.data_field)
+            ind_throat = np.argmin(self.data_field[0, 0, :] - self.model.profile['plug_div'][0, 0])
+            plug_throat = np.concatenate([np.repeat(self.model.profile['plug_div'][0: 1, :], n_sample, axis=0),
+                                          self.data_field[:, 1:, ind_throat]], axis=1)
+            my_sheet2 = pd.DataFrame(plug_throat, columns=['mesh_x', 'mesh_y', 'y', 'pressure', 'mach'])
+        except Exception as e:
+            print("Failed to generate sheet 2:", repr(e), file=sys.stderr)
+            my_sheet2 = None
+        # 收集塞锥壁面的坐标
+        try:
+            ind_plug1, ind_plug2 = self.model.get_profile()[1]['plug']
+            plug = np.concatenate([self.model.points[ind_plug1: ind_plug2 + 1],
+                                   self.data_field[0, :2, :].T], axis=1)
+            my_sheet3 = pd.DataFrame(plug, columns=['mesh_x', 'mesh_y', 'x', 'y'])
+            my_sheet3['delta_y'] = my_sheet3['mesh_y'] - my_sheet3['y']
+        except Exception as e:
+            print("Failed to generate sheet 3:", repr(e), file=sys.stderr)
+            my_sheet3 = None
+        return my_sheet1, my_sheet2, my_sheet3
+
+    def calc_cf(self, continuity_limit=10, n_net=16, n_int=400):
+        if self.data is None:
+            print("Please run `NozzleCFD.postproc()` to collect data first.", file=sys.stderr)
+            return
+        # 拟合cfd计算结果
+        data = self.data[np.logical_and(np.abs(self.data['report-def-continuity']) < continuity_limit,
+                                        0. < self.data['Cf'] < 10.)]  # 未收敛（发散）的结果直接丢弃
+        data_in = torch.tensor(data[['inlet_p', 'atmo_p', 'report-def-continuity']].to_numpy())
+        data_out = torch.tensor(data[['Cf']].to_numpy())
+        nets = train_net(DenoisePhysInStackWrapper, data_in, data_out, test_row=[], net_args={'hidden_n': 15},
+                         thread_n=self.thread, n_per_thread=math.ceil(n_net / self.thread))
+        plotter = Plotter(data_in, data_out, *nets)
+        err, err_std = plotter.score(noise_i=[2], noise_threshold=0.1)
+        print("Net error: %.2e ± %.2e %%" % (err.item() * 100, err_std.item() * 100))
+        # 绘制推力系数Cf关于燃烧室压强p0和环境压强pe的拟合曲面
+        if self.plot:
+            plotter.plot3d(margin=0.05)
+
+        # 假定部分参数不变，并简化去噪网络的输入和输出
+        def net_surface(X, Y):
+            x, y = X.flatten(), Y.flatten()
+            data_in = torch.tensor(np.vstack([x, y, np.zeros_like(x)]).T)
+            data_out = plotter.eval_net(data_in)[0]
+            return data_out.detach().numpy().reshape(X.shape)
+
+        # 计算参数范围
+        x_range = data_in[:, 0].min().item(), data_in[:, 0].max().item()
+        y_range = data_in[:, 1].min().item(), data_in[:, 1].max().item()
+        # 使用二维三点高斯积分计算当前参数域下Cf的平均值
+        dx = (x_range[1] - x_range[0]) / n_int
+        dy = (y_range[1] - y_range[0]) / n_int
+        X, Y = torch.meshgrid(torch.arange(x_range[0] + 0.5 * dx, x_range[1] + dx, dx),
+                              torch.arange(y_range[0] + 0.5 * dy, y_range[1] + dy, dy),
+                              indexing='ij')
+        k_x = 0.5 * dx * np.sqrt(3 / 5)
+        k_y = 0.5 * dy * np.sqrt(3 / 5)
+        Z = net_surface(X, Y)
+        Z_11 = net_surface(X - k_x, Y - k_y)
+        Z_12 = net_surface(X - k_x, Y + k_y)
+        Z_21 = net_surface(X + k_x, Y - k_y)
+        Z_22 = net_surface(X + k_x, Y + k_y)
+        cf_avg = (16 * Z.sum() + 5 * (Z_11.sum() + Z_12.sum() + Z_21.sum() + Z_22.sum())) / (36 * n_int ** 2)
+
+        # 保存去噪网络
+        info = {
+            'input/output': 'inlet_p, atmo_p, continuity -> Cf',
+            'MACs/params': profile(nets[0], inputs=torch.rand(size=(1, 1, nets[0].in_channels)), verbose=False)[1],
+            'error': err,
+            'error_std': err_std,
+            'n_int': n_int,
+            'Cf_int': cf_avg
+        }
+        save_net(os.path.join(self.base_path, 'net.pth'), *nets, desc=info)
+
+        return cf_avg
+
+
+class PlugSplineEnv(gym.Env[np.ndarray, Union[int, np.ndarray]]):
+    """
+    基于NozzleCFD构建的样条塞式喷管强化学习环境
+    """
+
+    def __init__(self, render_mode: Optional[str] = None, **kwargs):
+        # 参数设置
+        self.cfd_params = {'inlet_p': [13.32e6], 'atmo_p': [101325]}  # 这里给定当前r_t和ε下的最佳压强比
+        self.work_path = r'/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/'
+        self.fluent_path = r'/public/software/ansys_inc/v221/fluent/bin/fluent'
+        self.cfdpost_path = r'/public/software/ansys_inc/v221/CFD-Post/bin/cfdpost'
+        self.script_path = r'/home/zhuofeng/lgq/python/OpenFOAM/'
+        # self.work_path = r'F:\Nozzle\OpenFOAM\FluentWithDL'
+        # self.fluent_path = r'E:\Ansys\2022R1\v221\fluent\ntbin\win64\fluent.exe'
+        # self.cfdpost_path = r'E:\Ansys\2022R1\v221\CFD-Post\bin\cfdpost.exe'
+        # self.script_path = r'F:\Nozzle\OpenFOAM'
+        self.render_path = os.path.join(self.work_path, "render_%d" % int(time.time()))
+
+        self.thread_n = 16
+        self.spline_n = 5
+        self.delta_sp_max = 0.2
+        self.sp_margin = 0.01
+        self.step_reward_factor = 1.0
+        self.step_reward_base = 10
+        self.step_punishment = 1.0
+        self.cfd_continuity_limit = 2
+        self.cfd_cf_limit = 3
+        self.step_max = 20
+        self.step_time_max = 3600
+        self.convergence_criterion = 1.1
+
+        self.render_mode = render_mode
+        self.plot_n = 10
+
+        # 更新自定义参数
+        self.__dict__.update(**kwargs)
+
+        # 理想喷管的CFD计算
+        self.queue = QuestManager(parallel_n=self.thread_n)
+        self.queue.start()
+        self.config = NozzleConfig(jet_type='plug',
+                                   cfd_params=self.cfd_params,
+                                   work_path=self.work_path,
+                                   fluent_path=self.fluent_path,
+                                   script_path=self.script_path,
+                                   thread_n=self.thread_n,
+                                   render=False)
+        self.nozzle_target = NozzleCFD(self.config)
+        ret = self._cfd_run(self.nozzle_target)
+        assert ret and self.nozzle_target.data['report-def-continuity'][1] < self.cfd_continuity_limit, \
+            "plug calculation failed"
+
+        # 定义动作空间和状态空间
+        self.action_integral = None  # (length, theta, sp_1, ..., sp_n)
+        self.state = None  # ((x_1, ..., x_n), (y_1, ..., y_n), (p_1, ..., p_n), (Ma_1, ..., Ma_n))
+        self.step_count = None
+        self.epoch_count = None
+        self.cf_current = None
+        self.nozzle_dir_current = None  # 当前喷管构型的工作目录
+
+        self.action_dim = (self.spline_n + 2,)
+        self.action_space = gym.spaces.Box(low=-self.delta_sp_max * np.ones(self.action_dim),
+                                           high=self.delta_sp_max * np.ones(self.action_dim),
+                                           dtype=np.float64)
+        self.action_integral_space = gym.spaces.Box(low=np.zeros(self.action_dim) + self.sp_margin,
+                                                    high=np.ones(self.action_dim) - self.sp_margin,
+                                                    dtype=np.float64)
+        # observation_dim = self.nozzle_target.data_field.shape[-1]
+        self.observation_dim = (4, len(self.nozzle_target.model.profile['plug_div']))
+        self.observation_space = gym.spaces.Box(low=0,
+                                                high=1,  # 暂时不满足，实际值为0~1.几
+                                                shape=self.observation_dim,
+                                                dtype=np.float64)
+
+        # 定义基准量
+        self.cf_baseline, profile_target = self._cfd_get_state(self.nozzle_target)
+        self.profile_target = profile_target[: 2]
+        print("Cf_baseline / Cf_max = ", self.cf_baseline / self.nozzle_target.data['Cf_max'][1])
+
+        # 绘图窗口
+        self.screen = None
+        self.plot_lines = []
+        self.recent_profile = deque(maxlen=self.plot_n)
+        self.cf_data = []
+
+    def _generate_spline_plug(self, spline_p: Sequence) -> NozzleCFD:
+        """使用给定插值参数生成样条喷管"""
+        config = deepcopy(self.config)
+        config.update(jet_type='plug-sp', spline_p=spline_p)
+        config.mesh_n = int(config.mesh_n * spline_p[0])  # 根据样条喷管的长度参数调节扩张段节点数量
+        nozzle = NozzleCFD(config)
+        self.nozzle_dir_current = nozzle.base_path
+        return nozzle
+
+    def _model_is_valid(self, nozzle: NozzleCFD) -> bool:
+        """返回几何模型是否满足要求"""
+        return nozzle.model.is_increasing
+
+    def _cfd_run(self, nozzle: NozzleCFD) -> bool:
+        """用内置服务器队列提交fluent计算任务"""
+        try:
+            result_file = os.path.join(nozzle.base_path, 'fluent_result.txt')
+            if os.path.exists(result_file):  # 若结果文件存在，则跳过计算
+                print("Read existing result file: '%s'" % result_file)
+            else:
+                self.queue.submit(nozzle.task, worker_n=1)
+                time_wait = 0
+                task_id = len(self.queue.quest_info)
+                while True:
+                    running = self.queue.state_single(task_id)
+                    if not running:
+                        break
+                    time.sleep(1)
+                    time_wait += 1
+                    assert time_wait < self.step_time_max, "Maximum CFD running time reached"
+            nozzle.postproc()
+        except Exception as e:
+            traceback.print_exc()
+            # print(repr(e), file=sys.stderr)
+            return False
+        else:
+            return True
+
+    def _cfd_get_state(self, nozzle: NozzleCFD) -> Tuple[float, np.ndarray]:
+        """计算样条喷管的观测量（仅读取第一个工况的计算结果）"""
+        n = len(nozzle.model.profile['plug_div'])  # 塞锥型面几何点的数量
+        mesh_x, mesh_y, pressure, mach = nozzle.data_field[0, :, -n:]
+        if hasattr(nozzle.model, 'L_max'):
+            L_max = nozzle.model.L_max
+        else:
+            L_max = nozzle.model._Ma2plugXY(nozzle.model.Ma_e + 1e-6)[0, 0]
+        p_a = np.log10(nozzle.data['atmo_p'][1])
+        p_b = np.log10(nozzle.data['inlet_p'][1])
+        p = np.log10(pressure + nozzle.data['atmo_p'][1])
+        state = np.vstack([mesh_x / L_max,
+                           mesh_y / self.nozzle_target.model.R_e,
+                           (p - p_a) / (p_b - p_a),
+                           mach / nozzle.model.Ma_e])
+        # if nozzle.data_field.shape[-1] != self.nozzle_target.data_field.shape[-1]:  # 该条件会有极小概率失效（plug段网格点数量相等但扩张段不相等）
+        if n != self.observation_dim[1]:
+            # 对state进行插值，保证采样点数和nozzle_target一致（处理网格不一致问题）
+            x_new = np.linspace(state[0, 0], state[0, -1], self.observation_dim[1])
+            state = np.vstack([x_new,
+                               interp1d(state[0], state[1], kind='quadratic')(x_new),
+                               interp1d(state[0], state[2], kind='quadratic')(x_new),
+                               interp1d(state[0], state[3], kind='quadratic')(x_new)])
+        return nozzle.data['Cf'][1], state
+
+    def _cfd_get_reward(self, nozzle: NozzleCFD) -> float:
+        """计算样条喷管的奖励（仅读取第一个工况的计算结果）"""
+        Cf_prob = nozzle.data['Cf'][1] / nozzle.data['Cf_max'][1]  # 注意该值可能大于一
+        print("Cf / Cf_max = ", Cf_prob)
+        # 积累奖励
+        # reward = min(1.2, Cf_prob) * self.step_reward_max
+        # 指数积累奖励
+        reward = np.power(self.step_reward_base, Cf_prob - 1) * self.step_reward_factor
+        # 指数增量奖励
+        # reward_0 = np.power(self.step_reward_base, self.cf_current / self.cf_baseline - 1)
+        # reward = (np.power(self.step_reward_base, Cf_prob - 1) - reward_0) * self.step_reward_factor
+        return reward
+
+    def _cfd_is_converge(self, nozzle: NozzleCFD) -> bool:
+        """返回计算结果是否收敛"""
+        converge = np.abs(nozzle.data['report-def-continuity'][1]) < self.cfd_continuity_limit and \
+                   0. < nozzle.data['Cf'][1] < self.cfd_cf_limit
+        return converge
+
+    def _env_is_finish(self, nozzle: NozzleCFD) -> bool:
+        """返回当前回合是否结束"""
+        return self.step_count >= self.step_max or \
+            nozzle.data['Cf'][1] / self.cf_baseline >= self.convergence_criterion
+
+    def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
+        super().reset(seed=seed)
+        np.random.seed(seed)
+
+        options = {} if options is None else options
+        action_integral = options.get('action_integral')  # 可以指定初始构型
+        epoch_count = options.get('epoch_count')  # 可以指定初始回合数
+
+        nozzle = None
+        if action_integral is not None:
+            if self.action_integral_space.contains(action_integral):
+                nozzle = self._generate_spline_plug(action_integral)
+                if not self._model_is_valid(nozzle):
+                    action_integral = None
+            else:
+                action_integral = None
+        if action_integral is None:
+            print("Choose initial integral action with random seed %s" % seed)
+            # randomly choose initial integral action
+            while True:
+                action_integral = np.random.rand(self.action_integral_space.shape[0])
+                if self.action_integral_space.contains(action_integral):
+                    nozzle = self._generate_spline_plug(action_integral)
+                    if self._model_is_valid(nozzle):
+                        break
+
+        # calculate initial state
+        ret = self._cfd_run(nozzle)
+        assert ret and self._cfd_is_converge(nozzle), \
+            "plug-sp calculation failed"
+        self.action_integral = action_integral
+        self.cf_current, self.state = self._cfd_get_state(nozzle)
+        if epoch_count is not None:
+            self.epoch_count = epoch_count
+        elif self.epoch_count is None:
+            self.epoch_count = 0
+        else:
+            self.epoch_count += 1
+        self.step_count = 0
+
+        if self.render_mode is not None:
+            self.render()
+        return self.state, {}
+
+    def step(self, action: np.ndarray):
+        err_msg = f"{action!r} ({type(action)}) invalid"
+        assert self.action_space.contains(action), err_msg
+        assert self.state is not None, "Call reset before using step method."
+        new_action_integral = self.action_integral + action
+
+        # truncated：动作空间限制
+        if not self.action_integral_space.contains(new_action_integral):
+            return self.state, - self.step_punishment, False, True, {'type': 'invalid action space'}
+
+        # 样条喷管：创建构型
+        nozzle = self._generate_spline_plug(new_action_integral)
+
+        # truncated：样条型面单调性限制
+        if not self._model_is_valid(nozzle):
+            return self.state, - self.step_punishment, False, True, {'type': 'non-monotonic spline'}
+
+        # 样条喷管：CFD计算
+        ret = self._cfd_run(nozzle)
+
+        # truncated：计算失败或CFD收敛性限制
+        if not ret:
+            return self.state, - self.step_punishment, False, True, {'type': 'calculation failed'}
+        if not self._cfd_is_converge(nozzle):
+            return self.state, - self.step_punishment, False, True, {'type': 'calculation divergence'}
+
+        self.action_integral = new_action_integral
+        self.step_count += 1
+
+        reward = self._cfd_get_reward(nozzle)  # 需要在cf_current的值被覆盖前计算奖励
+        self.cf_current, self.state = self._cfd_get_state(nozzle)
+        terminated = self._env_is_finish(nozzle)
+
+        if self.render_mode is not None:
+            self.render()
+        return self.state, reward, terminated, False, {}
+
+    def render(self):
+        assert self.state is not None, "Call reset before using step method."
+        # 初始化绘图窗口
+        if self.screen is None:
+            fig, self.screen = plt.subplots(2, 1, figsize=(10, 8))
+            fig.suptitle("Spline Plug Environment")
+            self.plot_lines.append(self.screen[1].plot([], [], '.-')[0])
+            for i in range(self.plot_n):
+                alpha = (i + 1) / self.plot_n
+                self.plot_lines.append(self.screen[0].plot([], [], '-', alpha=alpha)[0])
+            # 绘制理想喷管推力系数和理论最优型面
+            self.screen[0].plot(*self.profile_target, '--', c='gray', linewidth=1.2)
+            self.screen[1].axhline(y=self.cf_baseline, linestyle='--', color='gray', linewidth=1.2)
+            # 绘图窗口设置
+            self.screen[1].set_xlabel('$Step$')
+            self.screen[1].set_ylabel('$C_f$')
+            self.screen[0].grid()
+            self.screen[1].grid()
+            # 创建渲染输出目录
+            os.makedirs(self.render_path, exist_ok=True)
+        else:
+            fig = self.screen[0].get_figure()
+        # 每轮次需要清空上一轮次的绘图数据
+        if self.step_count == 0:
+            self.recent_profile.clear()
+            self.cf_data = []
+            for line in self.plot_lines:
+                line.set_data([], [])
+
+        # 绘制推力系数曲线
+        self.cf_data.append([self.step_count, self.cf_current])
+        self.plot_lines[0].set_data(*np.array(self.cf_data).T)
+
+        # 绘制最新的{self.plot_n}条喷管型面
+        # self.recent_profile.append(self.state[: 2])
+        # profile = list(self.recent_profile)
+        # n = min(len(profile), self.plot_n)
+        # order = np.argsort(np.array(self.cf_data[-n:])[:, 1])
+        # cmap = plt.get_cmap('cool')
+        # for i in range(1, n + 1):
+        #     j = order[-i]
+        #     k = int(256 * (n - i) / n)
+        #     self.plot_lines[-i].set_data(*profile[j])
+        #     self.plot_lines[-i].set_color(cmap(k))
+        self.recent_profile.append(self.state[: 2])
+        profile = list(self.recent_profile)
+        n = min(len(profile), self.plot_n)
+        scale = 256 / (self.cf_baseline - 1)  # 1 < Cf < Cf_baseline
+        cmap = plt.get_cmap('cool')
+        for i in range(1, n + 1):
+            k = int(scale * (self.cf_data[-i][1] - 1))
+            self.plot_lines[-i].set_data(*profile[-i])
+            self.plot_lines[-i].set_color(cmap(k))
+
+        for ax in self.screen:
+            ax.relim()
+            ax.autoscale_view()
+        # fig.show()
+        plt.pause(0.01)
+
+        plt.savefig(os.path.join(self.render_path, f'{self.epoch_count:d}-{self.step_count:d}.png'))
+
+    def post_processing(self):
+        """使用CFDPost对工作路径下的全部算例文件执行后处理"""
+        cse_path = os.path.join(self.work_path, 'plug.cse')
+        copy_file(cse_path, os.path.join(self.script_path, 'plug.cse'))
+        task = CFDPostQuest(self.cfdpost_path, cse_path)
+        task.set_params(At=np.pi*self.nozzle_target.r_t**2,
+                        gamma_R=self.nozzle_target.params['gamma']*self.nozzle_target.params['R'])
+        task.set_datafile(suffix='-end.dat.h5')
+        self.queue.submit(task, worker_n=self.thread_n)
+        # 循环等待计算结束并收集结果
+        task_id = len(self.queue.quest_info)
+        while True:
+            running = self.queue.state_single(task_id)
+            if not running:
+                break
+            time.sleep(1)
+        task.get_result('result.txt', 'machNumber.png')
+
+    def close(self):
+        self.queue.stop()
+        if self.screen is not None:
+            fig = self.screen[0].get_figure()
+            fig.close()
+            self.screen = None
+
+    def __del__(self):
+        self.close()
+
+
+def generate_pretrain_data(data_file: str = 'pretrain_data.pth', n: int = 30, seed: int = 42, render: bool = False):
+    """借助LHS使用PlugSplineEnv生成特定数量的样本用于预训练
+    区别于非等距的全nozzle数据，该数据集等距"""
+    # 创建CFD环境
+    env = PlugSplineEnv(render_mode='human' if render else None,
+                        delta_sp_max=1.0, step_max=10000)
+    # 定义文件路径
+    _cuts = data_file.split('.')
+    if len(_cuts) == 1:
+        state_path = os.path.join(env.work_path, data_file)
+        label_path = os.path.join(env.work_path, _cuts[0] + '_cf')
+        list_path = os.path.join(env.work_path, _cuts[0] + '_list')
+    else:
+        state_path = os.path.join(env.work_path, data_file)
+        label_path = os.path.join(env.work_path, '.'.join(_cuts[: -1]) + '_cf.' + _cuts[-1])
+        list_path = os.path.join(env.work_path, '.'.join(_cuts[: -1]) + '.list')
+    state_list, label_list,  dir_list = [], [], []  # 样本观测（状态）、目标值（奖励）、算例目录
+    # 采样并计算样本点
+    samples = pyDOE2.lhs(env.action_dim[0], samples=n, criterion='center', random_state=seed)
+    state, _ = env.reset(seed=seed, options={'action_integral': samples[0]})
+    samples[0] = env.action_integral
+    state_list.append(state)
+    label_list.append(env.cf_current)
+    dir_list.append(env.nozzle_dir_current)
+    offset = 1
+    for i in range(1, n):
+        next_state, reward, terminated, truncated, _ = env.step(samples[i] - samples[i - offset])
+        if truncated:
+            offset += 1
+            print("Calculation failed, skip point %s" % samples[i])
+        else:
+            offset = 1
+            state_list.append(state)
+            label_list.append(env.cf_current)
+            dir_list.append(env.nozzle_dir_current)
+    # 将采样数据保存至文件
+    torch.save(state_list, state_path)
+    torch.save(label_list, label_path)
+    with open(list_path, 'w', encoding='utf-8') as f:
+        for item in enumerate(dir_list):
+            f.write("%d %s" % item)
+    print(f"{len(state_list):d}/{n:d} samples have beem saved to '{state_path:s}'")
+    return env, state_list, label_list
+
+
+def reduce_pretrain_data(data_dir: str, data_file: str = 'pretrain_data.pth', n: int = None, profile_only: bool = True):
+    """使用不同算法对预训练数据进行降维，从而可视化采样空间"""
+    # 定义文件路径
+    state_path = os.path.join(data_dir, data_file)
+    _cuts = data_dir.split('.')
+    if len(_cuts) == 1:
+        label_path = os.path.join(data_dir, _cuts[0] + '_cf')
+    else:
+        label_path = os.path.join(data_dir, '.'.join(_cuts[: -1]) + '_cf.' + _cuts[-1])
+    # 从文件中读取数据
+    states = torch.load(state_path)
+    if profile_only:  # 仅考虑构型，或同时考虑构型和流场
+        states = np.array([state[:, :2].flatten() for state in states])
+    else:
+        states = np.array([state.flatten() for state in states])
+    # states = (states - states.mean()) / states.std()
+    label = torch.load(label_path)
+    label = np.array(label)
+    assert len(states) == len(label), "Length of states and labels mismatch"
+    if n is not None:
+        states = states[:n]
+        label = label[:n]
+    # 递归最小二乘
+    rls = RLS(states.T, label)
+    rls.train(cycle_count=3)
+    states_p0 = np.vstack([rls.classify(states.T), label]).T
+    # PCA线性降维
+    pca = PCA(states.T)
+    pca.train(ndim=2)
+    states_p1 = pca.project(states.T).T
+    # t-SNE非线性降维
+    pca_ = PCA(states.T)
+    pca_.train(ndim=20)  # 先基于PCA降至20维
+    states_p2 = pca.project(states.T).T
+    tsne = TSNE(n_components=2, random_state=42, perplexity=30)  # 10 or 50 (perplexity: 5~50, less than sample_n)
+    states_p2 = tsne.fit_transform(states_p2)
+    # 可视化样本点
+    fig, ax = plt.subplots(1, 3, figsize=(12, 5))
+    kwargs = {'marker': 'o', 's': 14, 'c': label, 'cmap': plt.get_cmap('seismic')}
+    ax[0].set_title('RLS', fontsize=20)
+    diag = [0.6, 1.75]
+    ax[0].plot(diag, diag, '--', color='gray', alpha=0.6)
+    scatter_1 = ax[0].scatter(*states_p0.T, **kwargs)
+    ax[1].set_title('PCA', fontsize=20)
+    scatter_2 = ax[1].scatter(*states_p1.T, **kwargs)
+    ax[2].set_title('t-SNE', fontsize=20)
+    scatter_3 = ax[2].scatter(*states_p2.T, **kwargs)
+    for i in range(3):
+        ax[i].set_xticklabels([''] * len(ax[i].get_xticklabels()))
+        ax[i].set_yticklabels([''] * len(ax[i].get_xticklabels()))
+        ax[i].grid(alpha=0.5)
+
+    # 设置散点图注解
+    list_path = '.'.join(data_dir.split('.')[:-1]) + '.list'
+    picture_path = os.path.join(os.path.dirname(data_dir), 'cfdpost_pictures')
+    if os.path.exists(list_path):
+        tag = pd.read_csv(list_path, delimiter=' ', header=None)
+        if n is not None:
+            tag = tag[:n]
+        else:
+            assert len(tag) == len(states), "Length of tags and states mismatch"
+        ax = ax.tolist()
+        state = [states_p0, states_p1, states_p2]
+        scatter = [scatter_1, scatter_2, scatter_3]
+        annotate = [[], [], []]
+        image = []
+        for i, s in tag.to_numpy():
+            # 设置算例名注释
+            for j in range(3):
+                ann = ax[j].annotate(str(s).split('/')[-1], state[j][i], textcoords="figure fraction",
+                                     xytext=(0, 0), ha='left', va='bottom', size=10)
+                ann.set_visible(False)  # 初始时设置为不可见
+                annotate[j].append(ann)
+            # 预加载流场缩略图
+            img_file = os.path.join(picture_path,
+                                    'machNumber-' + os.path.basename(s) + '_' +
+                                    [d for d in os.listdir(s) if os.path.isdir(os.path.join(s, d))][0] + '.png')
+            if os.path.exists(img_file):
+                img = Image.open(img_file)
+                img.thumbnail((100, 100), Image.Resampling.LANCZOS)
+                image.append(np.array(img))
+            else:
+                image.append(None)
+        # 定义注解更新函数并绑定悬停事件
+        this_ann = annotate[0][0]
+        this_img = None
+
+        def handle(event):
+            nonlocal this_ann, this_img
+            this_ax = event.inaxes
+            if this_ax is None:
+                return
+            this_ann.set_visible(False)
+            if this_img is not None:
+                this_img.remove()
+                this_img = None
+            i = ax.index(this_ax)  # 查找当前子图的索引
+            cont, ind = scatter[i].contains(event)
+            if cont:
+                j = ind['ind'][0]
+                this_ann = annotate[i][j]
+                this_ann.set_visible(True)
+                if image[j] is not None:
+                    imagebox = OffsetImage(np.array(image[j]), zoom=1.0)
+                    imagebox.image.axes = this_ax
+                    img = AnnotationBbox(
+                        imagebox,
+                        state[i][j].tolist(),
+                        xybox=(-60, 40),
+                        xycoords='data',
+                        boxcoords="offset points",
+                        frameon=True,
+                        pad=0.3,
+                        bboxprops=dict(
+                            boxstyle="round,pad=0.1",
+                            facecolor="white",
+                            edgecolor="gray",
+                            linewidth=1,
+                            alpha=0.9
+                        )
+                    )
+                    this_img = this_ax.add_artist(img)
+            fig.canvas.draw_idle()
+
+        fig.canvas.mpl_connect('motion_notify_event', handle)  # button_press_event
+    fig.tight_layout()
+    fig.show()
+
+
+def collect_nozzle_data(data_dir: str, data_file: str = 'nozzle_data.pth'):
+    """收集给定目录下的所有nozzle数据（不作筛选和后处理），用于构建代理模型
+    区别于等距的预训练数据，该数据集非等距"""
+    data_list = []
+    # 对于完整的plug-sp的Nozzle仿真结果，以下文件必须存在
+    files = ['config.txt', 'fluent_result.txt', 'xy-plot-ycoord.txt',  'xy-plot-pressure.txt', 'xy-plot-mach.txt']
+    for item in os.listdir(data_dir):
+        path = os.path.join(data_dir, item)
+        if os.path.isdir(path) and item.startswith('plug-sp'):
+            if np.sum([os.path.exists(os.path.join(path, f)) for f in files]) == len(files):
+                with open(os.path.join(path, 'config.txt'), 'r', encoding='utf-8') as f:
+                    config = {'r_t': float(f.readline().strip()),
+                              'epsilon': float(f.readline().strip()),
+                              'spline_p': list(map(float, f.readline().strip().split()))  # 分隔符支持空格和制表
+                              }
+                nozzle = DataStruct(base_path=path,
+                                    r_t=config['r_t'],
+                                    data=None,
+                                    data_field=None)  # 虚构的NozzleCFD类
+                NozzleCFD.postproc(nozzle)  # 这里没有筛选发散的数据
+                data_list.append([config, nozzle.data, nozzle.data_field])
+    data_path = os.path.join(data_dir, data_file)
+    torch.save(data_list, data_path)
+    print(f"{len(data_list):d} nozzle data has been saved to '{data_path:s}'")
+    return data_list
+
+
+class PlugSplineSurrEnv(PlugSplineEnv):
+    """
+    基于NozzleCFD的强化学习环境，使用历史训练数据构建的代理模型来替换父类PlugSplineEnv中的耗时CFD计算
+    """
+    def __init__(self, render_mode: Optional[str] = None, **kwargs):
+        self._initialized = False
+        super().__init__(render_mode, **kwargs)
+
+        self.nozzle_data_path = os.path.join(self.work_path, 'nozzle_data.pth')
+        self.nozzle_surrogate_path = os.path.join(self.work_path, 'nozzle_surrogate.pth')
+        self.feature_dim = AgentConfig().sensor_hidden_dim
+
+        if os.path.exists(self.nozzle_surrogate_path):
+            self.nozzle_surrogate = torch.load(self.nozzle_surrogate_path)
+            print("Read surrogate model of PlugSplineEnv from '%s'" % self.nozzle_surrogate_path)
+        else:
+            self.nozzle_surrogate = self._train()
+            torch.save(self.nozzle_surrogate, self.nozzle_surrogate_path)
+            print("Save surrogate model of PlugSplineEnv to '%s'" % self.nozzle_surrogate_path)
+
+        self.observation_current = None
+
+        self._initialized = True
+
+    def _train(self, n_net: int = 16):
+        """使用PlugSplineEnv的历史计算数据构建代理模型"""
+        nozzle_data = torch.load(self.nozzle_data_path)
+        # 预处理喷管数据集，设置筛选：（1）r_t、epsilon、spline_n和环境设置一致（2）满足收敛条件（3）仅第一个工况
+        nozzle_key = np.array([(item[0]['r_t'], item[0]['epsilon'], len(item[0]['spline_p'])) for item in nozzle_data])
+        nozzle_query = np.array([self.nozzle_target.r_t, self.nozzle_target.epsilon, self.action_dim[0]])
+        cond_1 = np.sum((np.abs(nozzle_key / nozzle_query - 1.) < 1e-6), axis=1) == len(nozzle_query)
+        nozzle_converge = np.array([(item[1].iloc[0]['report-def-continuity'],
+                                     item[1].iloc[0]['Cf']) for item in nozzle_data])
+        cond_2 = np.logical_and(np.abs(nozzle_converge[:, 0]) < self.cfd_continuity_limit,
+                                (nozzle_converge[:, 1] > 0.) & (nozzle_converge[:, 1] < self.cfd_cf_limit))
+        ind = np.nonzero(np.logical_and(cond_1, cond_2))[0]
+        print(f"[Surr] use {len(ind):d}/{len(nozzle_data):d} nozzle data to train surrogate model")
+        config, data, data_field = np.array(nozzle_data, dtype=object)[ind].T  # np.ndarray
+        data = [val.iloc[0] for val in data]
+
+        # 预处理喷管数据集，根据当前强化学习环境的参数来进行缩放
+        def scale_data_field(states_raw):
+            mach_raw = states_raw[0, 3]
+            n = len(mach_raw) - np.nonzero(mach_raw > 1.)[0][0] + 1  # 根据马赫数等于一的位置推测塞锥型面几何点的数量
+            mesh_x, mesh_y, pressure, mach = states_raw[0, :, -n:]
+            L_max = self.nozzle_target.model._Ma2plugXY(self.nozzle_target.model.Ma_e + 1e-6)[0, 0]
+            p_a = np.log10(self.nozzle_target.data['atmo_p'][1])
+            p_b = np.log10(self.nozzle_target.data['inlet_p'][1])
+            p = np.log10(pressure + self.nozzle_target.data['atmo_p'][1])
+            state = np.vstack([mesh_x / L_max,
+                               mesh_y / self.nozzle_target.model.R_e,
+                               (p - p_a) / (p_b - p_a),
+                               mach / self.nozzle_target.model.Ma_e])
+            return state
+        data_field = list(map(scale_data_field, data_field))
+        # 首先使用data_field数据训练编码器和解码器
+        print(f"[Surr] hidden dimension of sensor: {self.feature_dim:d}")
+        t_start = time.time()
+        encoder, decoder, loss = train_dae(  # RecursiveSensor
+            data_field, feature_dim=self.feature_dim, net_type=1,  sample_dim=self.observation_dim[1],
+            lr=5e-1, num_epochs=400, batch_size=8, noise_p=0.1, weight_delay=1e-5, device='cuda',
+            net_args={'num_layers': 2, 'hidden_n': 1})
+        encoder = encoder[0]
+        t_end = time.time() - t_start
+        print(f"[Surr] sensor training finished (loss: {loss[-1, 1]:.3e}, time: {t_end:.2e} s)")
+        # 构建用于训练主网络的数据集
+        parameter = np.array([val['spline_p'] for val in config])
+        lengths = torch.tensor([state.shape[1] for state in data_field])
+        states = pad_sequence([torch.tensor(state.T) for state in data_field], batch_first=True)
+        feature = encoder(states.to(device='cuda'), lengths).detach().cpu().numpy()
+        variable = np.array([val[['Cf', 'SpecImpulse', 'report-def-continuity']].to_numpy() for val in data])
+        input_data = torch.tensor(np.hstack([parameter, variable[:, [2]]]))
+        output_data = torch.tensor(np.hstack([feature, variable[:, [0, 1]]]))
+        # 然后使用data和feature数据训练主网络（代理模型）
+        print(f"[Surr] backbone: {input_data.shape[1]:d} channels -> {output_data.shape[1]:d} channels")
+        t_start = time.time()
+        nets = train_net(DenoiseWrapper, input_data, output_data, test_row=[],
+                         net_args={'hidden_n': 32, 'layer_n': 5}, thread_n=1, n_per_thread=n_net)
+        plotter = Plotter(input_data, output_data, *nets)
+        err, err_std = plotter.score()
+        t_end = time.time() - t_start
+        print(f"[Surr] main network training finished",
+              f"(error: {err.mean().item()*100:.2e} ± {err_std.mean().item()*100:.2e} %, time: {t_end:.2e} s)")
+        # 生成代理模型
+        decoder.to('cpu')
+        encoder.to('cpu')
+        surrogate = {
+            'main': plotter,
+            'decoder': decoder,  # 输出等间距样本点，同PlugSplineEnv一致
+            'encoder': encoder  # 输入非等距样本点（全nozzle数据集训练），因此不可作为感知器使用
+        }
+        return surrogate
+
+    def _generate_spline_plug(self, spline_p: Sequence) -> NozzleCFD:
+        # 型面生成阶段就完成代理模型的计算
+        parameter = torch.tensor(np.hstack([spline_p, np.zeros(1)])).unsqueeze(0)
+        feature, feature_std = self.nozzle_surrogate['main'].eval_net(parameter)
+        cf = feature[0, self.feature_dim].item()
+        state = self.nozzle_surrogate['decoder'](feature[:, : self.feature_dim])
+        state = state.detach().numpy()[0].T
+        confidence = torch.exp(- feature_std[0] / self.nozzle_surrogate['main'].data_out.std(dim=0))
+        self.observation_current = (cf, state, confidence.mean().item())
+        return self.nozzle_target
+
+    def _model_is_valid(self, nozzle: NozzleCFD) -> bool:
+        # 返回型面预测值的单调性
+        y = self.observation_current[1][1]
+        return np.all(y[:-1] > y[1:])
+
+    def _cfd_run(self, nozzle: NozzleCFD) -> bool:
+        if self._initialized:
+            print("[Surr] average prediction confidence: %.2f%%" % (self.observation_current[2] * 100))
+            return True
+        else:
+            return super()._cfd_run(nozzle)
+
+    def _cfd_get_state(self, nozzle: NozzleCFD) -> Tuple[float, np.ndarray]:
+        if self._initialized:
+            return self.observation_current[0], self.observation_current[1]
+        else:
+            return super()._cfd_get_state(nozzle)
+
+    def _cfd_get_reward(self, nozzle: NozzleCFD) -> float:
+        Cf_prob = self.observation_current[0] / nozzle.data['Cf_max'][1]  # 注意该值可能大于一
+        print("Cf / Cf_max = ", Cf_prob)
+        # 积累奖励
+        # reward = min(1.2, Cf_prob) * self.step_reward_max
+        # 指数积累奖励
+        reward = np.power(self.step_reward_base, Cf_prob - 1) * self.step_reward_factor
+        # 指数增量奖励
+        # reward_0 = np.power(self.step_reward_base, self.cf_current / self.cf_baseline - 1)
+        # reward = (np.power(self.step_reward_base, Cf_prob - 1) - reward_0) * self.step_reward_factor
+        return reward
+
+    def _cfd_is_converge(self, nozzle: NozzleCFD) -> bool:
+        return True
+
+    def _env_is_finish(self, nozzle: NozzleCFD) -> bool:
+        return self.step_count >= self.step_max or \
+            self.observation_current[0] / self.cf_baseline >= self.convergence_criterion
+
+
+def test_nozzle_cfd():
+    q = QuestManager(parallel_n=64)
+    q.start()
+
+    # 理想喷管
+    # config = NozzleConfig(jet_type='plug',
+    #                       cfd_params={'inlet_p': [13.32e6], 'atmo_p': [101325]},
+    #                       work_path=r'/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/')
+    # nozzle = NozzleCFD(config)
+
+    # 样条喷管
+    config = NozzleConfig(jet_type='plug-sp',
+                          spline_p=[1, 0.5, 0.5, 0.5, 0.5, 0.2, 0.2],
+                          cfd_params={'inlet_p': [13.32e6], 'atmo_p': [101325]},
+                          work_path=r'/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/')
+    nozzle = NozzleCFD(config)
+
+    q.submit(nozzle.task, worker_n=4)
+    nozzle.postproc()
+    print(nozzle.calc_cf(n_net=16))
+
+    q.stop()
+
+
+if __name__ == '__main__':
+    # RuntimeError: Unable to handle autograd's threading in combination with fork-based multiprocessing
+    # set_start_method('spawn')
+
+    data_path = r'/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/'  # r'F:/Nozzle/OpenFOAM/'
+
+    # env = PlugSplineEnv(render_mode='human')
+    # env.reset(seed=42)
+    # env.step(np.array([0.2, -0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+    # env.post_processing()
+
+    # 预训练样本数：101/(30+110)
+    # env, states, cf = generate_pretrain_data(data_file='pretrain_data_1.pth', n=30, render=True)
+    # env, states, cf = generate_pretrain_data(data_file='pretrain_data_2.pth', n=110, render=True)
+
+    # 预训练样本数：175/250
+    # env, states, cf = generate_pretrain_data(n=250, render=True)
+
+    # 预训练样本可视化
+    # reduce_pretrain_data(data_path + 'pretrain_data.pth', data_path + 'pretrain_data_cf.pth')
+
+    # 基于代理模型的强化学习环境
+    # nozzle_data = collect_nozzle_data(data_path)
+    env = PlugSplineSurrEnv(render_mode='human')
+    data_in = env.nozzle_surrogate['main'].data_in.numpy()
+    data_out = env.nozzle_surrogate['main'].data_out.numpy()
+    # plotter = env.nozzle_surrogate['main']
+    env.reset(seed=42, options={'action_integral': data_in[0, : -1]})
+    env.step(np.array([-0.2, 0.2, 0.0, 0.0, 0.0, 0.0, 0.0]))
+
+

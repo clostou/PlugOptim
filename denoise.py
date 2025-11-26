@@ -3,13 +3,14 @@ import random
 import sys
 import time
 from io import BytesIO
-from typing import Union, List, Iterable, Any, Type, Optional
+from typing import Union, List, Tuple, Iterable, Callable, Any, Type, Optional
 from threading import Thread
 
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 import numpy as np
 import pandas as pd
+from scipy.stats import qmc
 from scipy.interpolate import interp1d
 
 import torch
@@ -19,6 +20,8 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.multiprocessing import Process, Queue
 from torchinfo import summary
 from thop import profile
+import shap
+from shap.plots import colors
 
 sys.path.append('/home/zhuofeng/lgq/python/')
 
@@ -29,7 +32,12 @@ from cfd_toolbox.utils import *
 from cfd_toolbox.gasdy import *
 from cfd_toolbox.plot import *
 from ML.regress import CurveFitting
+from ML.BOA import GPR
+from ML.regress import RBF
 from ML.reduce import PCA
+
+
+# TODO: 将去噪网络的训练迁移GPU上，加快训练速度
 
 
 class ResidualBlock(nn.Module):
@@ -48,10 +56,10 @@ class ResidualBlock(nn.Module):
 
 class DenoiseNet(nn.Module):
 
-    def __init__(self, input_channels, num_channels, output_channels, block_n=3):
+    def __init__(self, input_channels, num_channels, output_channels, block_n=3, block_multiply=4):
         super(DenoiseNet, self).__init__()
         self.block_n = block_n
-        self.residual = nn.Sequential(*[ResidualBlock(num_channels, 4 * num_channels, drop_p=0.0)
+        self.residual = nn.Sequential(*[ResidualBlock(num_channels, block_multiply * num_channels, drop_p=0.0)
                                         for _ in range(block_n)])
         self.linear_in = nn.Linear(input_channels, num_channels)
         self.linear_out = nn.Linear(num_channels, output_channels)
@@ -76,14 +84,14 @@ class FullConnectNet(nn.Module):
         self.linear_down = nn.Linear(num_channels, output_channels)
 
     def forward(self, X):
-        X = self.linear_up(X)
+        X = self.linear_up(F.tanh(X))
         X = self.hidden(X)
-        return self.linear_down(F.tanh(X))
+        return self.linear_down(X)
 
 
 def normalize(data, type):
     """归一化给定的数据集（按行排列），返回归一化函数及反函数"""
-    if type == 'maxmin':
+    if type == 'minmax':
         _min = data.min(axis=0)
         _max = data.max(axis=0)
         if isinstance(data, torch.Tensor):
@@ -181,7 +189,9 @@ class BaseNetWrapper(nn.Module):
     weight = 0.0  # 物理损失权重
 
     def __init__(self, in_channels: int, out_channels: int,
-                 data_in: torch.Tensor = None, data_out: torch.Tensor = None):
+                 data_in: torch.Tensor = None, data_out: torch.Tensor = None,
+                 backbone: str = 'de', hidden_n: int = None, hidden_mul: int = None,
+                 layer_n: int = None, phy_weight: float = None):
         super(BaseNetWrapper, self).__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
@@ -191,10 +201,25 @@ class BaseNetWrapper(nn.Module):
         assert np.ndim(dummy_y) == 2
         in_channels = self.in_channels + dummy_y.shape[1]
         # 创建网络
-        self.net = DenoiseNet(input_channels=in_channels,
-                              num_channels=self.hidden_channels,
-                              output_channels=self.out_channels,
-                              block_n=self.layer_n)
+        if hidden_n is not None:
+            self.hidden_channels = hidden_n
+        if layer_n is not None:
+            self.layer_n = layer_n
+        if phy_weight is not None:
+            self.weight = phy_weight
+        if backbone == 'de':  # DenoiseNet
+            self.net = DenoiseNet(input_channels=in_channels,
+                                  num_channels=self.hidden_channels,
+                                  output_channels=self.out_channels,
+                                  block_n=self.layer_n,
+                                  **{} if hidden_mul is None else {'block_multiply': hidden_mul})
+        elif backbone == 'fc':  # FullConnectNet
+            self.net = FullConnectNet(input_channels=in_channels,
+                                      num_channels=self.hidden_channels,
+                                      output_channels=self.out_channels,
+                                      layer_n=self.layer_n)
+        else:
+            raise TypeError("Unsupported type of backbone network: %s" % backbone)
         # 调整数据的通道数以符合网络要求
         if data_in is not None:
             if data_in.shape[1] < self.in_channels:
@@ -277,13 +302,13 @@ class DenoiseWrapper(BaseNetWrapper):
     用于回归问题的神经网络（含噪声数据），通过继承该类可以实现额外物理信息的嵌入
     """
 
-    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, noise_channels: int = 1):
+    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, noise_channels: int = 1, **kwargs):
         # 默认将网络的最后一个输入保留为噪声通道
         in_channels = data_in.shape[1]
         out_channels = data_out.shape[1]
         scale_channels = in_channels - max(min(noise_channels, in_channels), 0)
         _data_in = data_in[:, : scale_channels]  # 提取非噪声通道，即指定网络只对噪声通道以外的通道进行归一化
-        super(DenoiseWrapper, self).__init__(in_channels, out_channels, _data_in, data_out)
+        super(DenoiseWrapper, self).__init__(in_channels, out_channels, _data_in, data_out, **kwargs)
 
 
 class DenoisePhysInWrapper(DenoiseWrapper):
@@ -299,7 +324,7 @@ class DenoisePhysInWrapper(DenoiseWrapper):
     noise_channels = 1
     out_channels = 4
 
-    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor):
+    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, **kwargs):
         # 定义常量
         self.gas_prop = {
             'Cp': 2837.76,  # 1006.43
@@ -312,11 +337,13 @@ class DenoisePhysInWrapper(DenoiseWrapper):
         # 检查给定数据的通道数是否正确
         self.check_data(data_in, data_out)
 
-        super(DenoisePhysInWrapper, self).__init__(data_in, data_out, noise_channels=1)
+        super(DenoisePhysInWrapper, self).__init__(data_in, data_out, noise_channels=1, **kwargs)
 
     def _extra_input(self, data_in: torch.Tensor):
         inlet_p = data_in[:, 0]
         atmo_p = data_in[:, 1]
+        if torch.any(atmo_p > inlet_p):  # 物理方程的定义域限制
+            atmo_p = inlet_p
         return torch.vstack([Qm_max(inlet_p, self.inlet_t, self.area_t, self.gas_prop['gamma'], self.gas_prop['R']),
                              Cf_max(inlet_p, atmo_p, self.gas_prop['gamma'])]).T
 
@@ -330,8 +357,8 @@ class DenoisePhysInStackWrapper(DenoisePhysInWrapper):
 
     out_channels = 1
 
-    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor):
-        super(DenoisePhysInStackWrapper, self).__init__(data_in, data_out)
+    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, **kwargs):
+        super(DenoisePhysInStackWrapper, self).__init__(data_in, data_out, **kwargs)
 
 
 class DenoisePhysOutWrapper(DenoiseWrapper):
@@ -348,13 +375,13 @@ class DenoisePhysOutWrapper(DenoiseWrapper):
     out_channels = 4
     weight = 0.5
 
-    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor):
+    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, **kwargs):
         # 定义常量
         self.area_t = np.pi * 0.2 ** 2
         # 检查给定数据的通道数是否正确
         self.check_data(data_in, data_out)
 
-        super(DenoisePhysOutWrapper, self).__init__(data_in, data_out, noise_channels=1)
+        super(DenoisePhysOutWrapper, self).__init__(data_in, data_out, noise_channels=1, **kwargs)
 
     def _extra_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         inlet_p = x[:, 0]
@@ -382,7 +409,7 @@ class DenoisePhysInOutWrapper(DenoiseWrapper):
     out_channels = 4
     weight = 0.5
 
-    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor):
+    def __init__(self, data_in: torch.Tensor, data_out: torch.Tensor, **kwargs):
         # 定义常量
         self.gas_prop = {
             'Cp': 2837.76,  # 1006.43
@@ -395,7 +422,7 @@ class DenoisePhysInOutWrapper(DenoiseWrapper):
         # 检查给定数据的通道数是否正确
         self.check_data(data_in, data_out)
 
-        super(DenoisePhysInOutWrapper, self).__init__(data_in, data_out, noise_channels=1)
+        super(DenoisePhysInOutWrapper, self).__init__(data_in, data_out, noise_channels=1, **kwargs)
 
     def _extra_input(self, data_in: torch.Tensor):
         inlet_p = data_in[:, 0]
@@ -586,7 +613,8 @@ class Trainer(Process):
                       "Total params: %s" % num2str(params), sep='\n')
             optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, betas=(0.9, 0.999), weight_decay=0.00005)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300], gamma=0.2)
-            early_stopping = EarlyStopping(patience=100, skip_epoch=200, verbose=False)
+            early_stopping = EarlyStopping(skip_epoch=self.max_epochs if len(test_row) == 0 else 200,
+                                           patience=100, verbose=False)
 
             epoch = 0
             self.loss_history = []
@@ -624,6 +652,7 @@ class Trainer(Process):
             # 读取损失最小的历史检查点，并发送至主进程
             # epoch = early_stopping.resume(net)
             self.queue.put(('net', net, epoch))
+        time.sleep(1)  # 确保进程结束队列关闭前所有数据都传输完成
 
     def plot_loss(self):
         if len(self.loss_history) == 0:
@@ -693,7 +722,7 @@ class FineTuner(Trainer):
                 summary(net)
             optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, betas=(0.9, 0.999), weight_decay=0.00005)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.max_epochs, eta_min=0)
-            early_stopping = EarlyStopping(patience=50, skip_epoch=0, verbose=False)
+            early_stopping = EarlyStopping(patience=50, skip_epoch=500, verbose=False)
 
             epoch = 0
             self.loss_history = []
@@ -738,7 +767,8 @@ class Plotter:
     绘图工具类，用于在数据集上评估一个或多个网络
     """
 
-    def __init__(self, x: torch.Tensor, y: torch.Tensor, *nets: BaseNetWrapper):
+    def __init__(self, x: torch.Tensor, y: torch.Tensor, *nets: BaseNetWrapper,
+                 x_label: List[str] = None, y_label: List[str] = None):
         if len(nets) == 0:
             raise ValueError("At least one net should be provided")
         nets[0].check_data(x, y)
@@ -746,6 +776,9 @@ class Plotter:
         self.data_in = x
         self.data_out = y
         self.latent_dist = self._latent_distribution()  # 原始输入至输入潜空间的归一化参数
+        self.shap_values = None  # Shapley值，通过采样和输入输出建模来解释网络
+        self.x_label = ['$in_{%d}$' % i for i in range(x.shape[1])] if x_label is None else x_label
+        self.y_label = ['$out_{%d}$' % i for i in range(y.shape[1])] if y_label is None else y_label
 
     def _latent_distribution(self):
         """计算网络集成的平均输入变换"""
@@ -783,7 +816,7 @@ class Plotter:
 
     @torch.no_grad()
     def score(self, noise_i: List[int] = None, noise_threshold: float = 0.1):
-        """计算网络在给定数据集上的误差"""
+        """计算网络在给定数据集上的平均误差"""
         if noise_i is None:
             data_in = self.data_in
             data_out = self.data_out
@@ -795,7 +828,7 @@ class Plotter:
         error_list = []
         for net in self.nets:
             data_out_hat = net.forward(data_in)
-            error_list.append(torch.mean(torch.abs(data_out_hat - data_out) / data_out, dim=0))
+            error_list.append(torch.mean(torch.abs(data_out_hat / data_out - 1.), dim=0))
         error = torch.vstack(error_list)
         mean = error.mean(dim=0)
         std = error.std(dim=0) if len(self.nets) > 1 else torch.zeros_like(mean)
@@ -806,6 +839,7 @@ class Plotter:
         """绘制网络集成在给定数据集上的拟合曲线和误差分布"""
         x = np.arange(len(self.data_in))
         y = self.data_out[:, out_i]
+        y_label = self.y_label[out_i] if y_label is None else y_label
 
         fig = plt.figure(figsize=(12, 8))
         gs = GridSpec(3, 1, figure=fig)
@@ -813,14 +847,14 @@ class Plotter:
         ax2 = fig.add_subplot(gs[2, 0])
         y_hat, y_hat_std = self.result(out_i)
         y_error = 100 * torch.abs(y_hat / y - 1)
-        ax1.plot(x, y_hat, 'b.-', label="fitting")
+        ax1.plot(x, y_hat, 'b.-', label="$fitting$")
         ax1.fill_between(x, y_hat - 2 * y_hat_std, y_hat + 2 * y_hat_std,
                          facecolor='blue', alpha=0.2)
         ax2.bar(x, y_error, color='dodgerblue')
         if noise_i is not None:
             _y_hat, _y_hat_std = self.result(out_i, noise_i)
             _y_error = 100 * torch.abs(_y_hat / y - 1)
-            ax1.plot(x, _y_hat, 'r.-', label="denoise")
+            ax1.plot(x, _y_hat, 'r.-', label="$denoise$")
             ax1.fill_between(x, _y_hat - 2 * _y_hat_std, _y_hat + 2 * _y_hat_std,
                              facecolor='red', alpha=0.2)
             invalid_row = np.sum(self.data_in[:, noise_i].numpy() > noise_threshold, axis=1, dtype=bool)
@@ -828,20 +862,16 @@ class Plotter:
                 ax1.axvline(_x, c='gray', alpha=0.3)  # 标识超出噪声阈值的样本
             shift = _y_error - y_error
             shift[invalid_row] = 0.
-            colors = np.array(['#FF5151'] * len(x))
-            colors[shift < 0] = '#93FF93'
-            ax2.bar(x, shift, color=colors, bottom=y_error)
+            color_list = np.array(['#FF5151'] * len(x))
+            color_list[shift < 0] = '#93FF93'
+            ax2.bar(x, shift, color=color_list, bottom=y_error)
             ax2.set_ylim(0, 1.05 * (torch.clamp(shift, min=0) + y_error).max().item())
-        ax1.plot(x, y, 'k.-', label="origin")
+        ax1.plot(x, y, 'k.-', label="$origin$")
         ax1.set_xticklabels([])
         ax2.set_xlabel("$case_i$", fontsize=20)
-        if y_label:
-            ax1.set_ylabel(y_label, fontsize=20)
-            ax2.set_ylabel(f"$error$ $of$ {y_label} %", fontsize=20)
-        else:
-            ax1.set_ylabel("$value$", fontsize=20)
-            ax2.set_ylabel("$error$ %", fontsize=20)
-        ax1.legend(loc='lower right')
+        ax1.set_ylabel(y_label, fontsize=20)
+        ax2.set_ylabel(f"$error$ $of$ {y_label} %", fontsize=20)
+        ax1.legend(loc='lower right', fontsize=18)
         fig.tight_layout()
         fig.show()
 
@@ -893,18 +923,20 @@ class Plotter:
              interp_i: int = None, line_dim: int = None, section: Iterable[Any] = None,
              x_label: str = None, y_label: str = None):
         """在特定投影坐标面上绘制网络的拟合曲线"""
+        x_label = self.x_label[in_i] if x_label is None else x_label
+        y_label = self.y_label[out_i] if y_label is None else y_label
         fig, ax = plt.subplots()
         if section is None or (line_dim is None and np.ndim(section) == 1):
             # 在section定义的投影面上绘制
             data_in, distance = self._pre_plot(in_i, n=n, margin=margin, section=section)
             data_out, data_out_std = self.eval_net(data_in)
             ax.scatter(self.data_in[:, in_i], self.data_out[:, out_i],
-                       s=16, c=distance, cmap='viridis', label="Observation")
-            ax.plot(data_in[:, in_i], data_out[:, out_i], label="Prediction")
+                       s=16, c=distance, cmap='viridis', label="$Observation$")
+            ax.plot(data_in[:, in_i], data_out[:, out_i], label="$Prediction$")
             ax.fill_between(data_in[:, in_i],
                             data_out[:, out_i] - 2 * data_out_std[:, out_i],
                             data_out[:, out_i] + 2 * data_out_std[:, out_i],
-                            facecolor='blue', alpha=0.2, label="95% confidence interval")  # 95.4%置信区间
+                            facecolor='blue', alpha=0.2, label="$95$% $confidence$ $interval$")  # 95.4%置信区间
             if interp_i is not None:
                 # 当只有一个投影面时，可以绘制额外绘制一条包含插值的曲线
                 if interp_i == in_i:
@@ -938,14 +970,8 @@ class Plotter:
                                s=16, c=distance, cmap='viridis', label="Observation")
                 data_out, data_out_std = self.eval_net(data_in)
                 ax.plot(data_in[:, in_i], data_out[:, out_i], label="Prediction-%d" % i)
-        if x_label:
-            ax.set_xlabel(x_label, fontsize=20)
-        else:
-            ax.set_xlabel("${in}_{%d}$" % in_i)
-        if y_label:
-            ax.set_ylabel(y_label, fontsize=20)
-        else:
-            ax.set_ylabel("${out}_{%d}$" % out_i)
+        ax.set_xlabel(x_label, fontsize=20)
+        ax.set_ylabel(y_label, fontsize=20)
         ax.autoscale()
         ax.legend()
         ax.grid()
@@ -956,6 +982,8 @@ class Plotter:
         """在潜空间的原点截面上，绘制网络各个通道间的拟合曲线"""
         n_in = self.nets[0].in_channels
         n_out = self.nets[0].out_channels
+        x_label = self.x_label if x_label is None else x_label
+        y_label = self.y_label if y_label is None else y_label
         fig, axes = plt.subplots(n_out, n_in, sharex='col', sharey='row', figsize=(10, 8))
         axes = np.reshape(axes, (n_out, -1))
         fig.suptitle(f"Origin cross section of fitting hyperplane (dim: {n_in} -> {n_out})")
@@ -971,15 +999,9 @@ class Plotter:
                                 data_out[:, out_i] + 2 * data_out_std[:, out_i],
                                 facecolor='blue', alpha=0.2)  # 95.4%置信区间
                 if out_i + 1 == n_out:
-                    if isinstance(x_label, list):
-                        ax.set_xlabel(x_label[in_i], fontsize=20)
-                    else:
-                        ax.set_xlabel("${in}_{%d}$" % in_i)
+                    ax.set_xlabel(x_label[in_i], fontsize=20)
                 if in_i == 0:
-                    if isinstance(y_label, list):
-                        ax.set_ylabel(y_label[out_i], fontsize=20)
-                    else:
-                        ax.set_ylabel("${out}_{%d}$" % out_i)
+                    ax.set_ylabel(y_label[out_i], fontsize=20)
                 ax.autoscale()
                 ax.grid()
         fig.show()
@@ -1004,37 +1026,212 @@ class Plotter:
                    s=16, c=distance, cmap='viridis')
         plt.show()
 
+    def shap_sample(self, n_sample: int = 200, seed: int = 1, bounds: Iterable[Tuple[float, float]] = None,
+                    mapping: Callable = None, mapping_dim: int = None):
+        """结合LHS和KernelExplainer计算网络的SHAP值, 可额外指定采样空间至网络输入的映射"""
+        if bounds is None:
+            _max = self.data_in.max(dim=0)[0]
+            _min = self.data_in.min(dim=0)[0]
+            l_bounds = 1.1 * _min - 0.1 * _max
+            u_bounds = 1.1 * _max - 0.1 * _max
+        else:
+            l_bounds, u_bounds = zip(*bounds)
+        if mapping is not None:
+            if mapping_dim is None:
+                raise ValueError("Mapping from sample space to net input space needs 'mapping_dim' to be set")
+            sampler = qmc.LatinHypercube(d=mapping_dim, seed=seed)
+            sample = qmc.scale(sampler.random(n=n_sample), l_bounds, u_bounds)
+            sample = mapping(sample)
+        else:
+            sampler = qmc.LatinHypercube(d=self.data_in.shape[1], seed=seed)
+            sample = qmc.scale(sampler.random(n=n_sample), l_bounds, u_bounds)
+        if sample.shape[1] != self.data_in.shape[1]:
+            raise ValueError("Dimension of mapping output should equal to net input, but (%d) and (%d) is given"
+                             % (sample.shape[1], self.data_in.shape[1]))
+        # 构建KernelExplainer解释器，并使用采样集估计网络特征的SHAP值
+        explainer = shap.KernelExplainer(lambda x: self.eval_net(torch.tensor(x))[0].detach().numpy(),
+                                         pd.DataFrame(self.data_in.numpy(),
+                                                      columns=[s.split('/')[0].strip() for s in self.x_label]))
+        self.shap_values = explainer(sample)
 
-def train_net(net_type, data_in, data_out, test_row, data_in_extra=None, thread_n=1, n_per_thread=1) -> list:
+    def shap_save(self, shap_file: str = None):
+        """将SHAP值保存至缓存文件"""
+        if self.shap_values is None:
+            raise ValueError("Before using SHAP values, \
+            please create by Plotter.shap_sample or Plotter.shap_load first")
+        os.makedirs(os.path.dirname(shap_file), exist_ok=True)
+        torch.save(self.shap_values, shap_file)
+
+    def shap_load(self, shap_file: str = None):
+        """从缓存文件中读取SHAP值"""
+        shap_values = torch.load(shap_file)
+        if isinstance(shap_values, shap.Explanation) and \
+                len(shap_values.shape) == 3 and \
+                shap_values.shape[1] == self.data_in.shape[1] and \
+                shap_values.shape[2] == self.data_out.shape[1]:
+            self.shap_values = shap_values
+        else:
+            raise ValueError(f"Except 'Explanation (m, {self.data_in.shape[1]}, {self.data_out.shape[1]})' but"
+                             f"'{shap_values.__class__.__name__} {np.shape(shap_values)}' is given")
+
+    def shap_plot_all(self, hist: bool = True, dot_size: int = 16, alpha: float = 1.):
+        """绘制网络所有输入输出SHAP值，绘制方式类似于plot_all函数"""
+        if self.shap_values is None:
+            raise ValueError("Before using SHAP values, \
+            please create by Plotter.shap_sample or Plotter.shap_load first")
+        m, n, k = self.shap_values.shape
+        # randomize the ordering so plotting overlaps are not related to data ordering
+        oinds = np.arange(m)
+        np.random.shuffle(oinds)
+        shap_values = self.shap_values[oinds, :, :]
+        # 分别绘制每一对输入输出的SHAP值
+        fig, axes = plt.subplots(k, n, sharex='col')
+        for j in range(k):
+            sub_shap_value = shap_values[:, :, j]
+            for i in range(n):
+                ax = axes[j, i]
+                # guess what other feature as the strongest interaction with the plotted feature
+                interact_ind = shap.utils.approximate_interactions(i, sub_shap_value.values, sub_shap_value.data)[0]
+                ax.axhline(0, color="#888888", lw=0.6, dashes=(1, 5), zorder=-1)
+                # 绘制散点图
+                xvals = sub_shap_value.data[:, i]
+                svals = sub_shap_value.values[:, i]
+                cvals = sub_shap_value.data[:, interact_ind]
+                p = ax.scatter(xvals, svals, s=dot_size, c=cvals, linewidth=0,
+                               cmap=colors.red_blue, alpha=alpha, rasterized=m > 500)
+                p.set_array(cvals)
+                # 绘制色度条
+                cb = plt.colorbar(p, ticks=[], ax=ax, aspect=40, shrink=0.9)
+                cb.set_ticklabels([])
+                cb.set_alpha(1)
+                cb.outline.set_visible(False)
+                cb.ax.set_title(self.x_label[interact_ind].split('/')[0].strip(), fontsize=18,
+                                pad=4, ha='center', va='bottom')
+                if hist:
+                    # 绘制频率分布直方图
+                    ax2 = ax.twinx()
+                    ax2.hist(xvals, bins=20, density=False, facecolor='#000000', alpha=0.1,
+                             range=ax.get_xlim(), zorder=-1)
+                    ax2.set_ylim(0, m)
+                    ax2.yaxis.set_ticks([])
+                    ax2.spines['right'].set_visible(False)
+                    ax2.spines['top'].set_visible(False)
+                    ax2.spines['left'].set_visible(False)
+                    ax2.spines['bottom'].set_visible(False)
+                # 绘图细节调整
+                ax.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+                ax.tick_params(axis='both', labelsize=16)
+                ax.xaxis.get_offset_text().set_fontsize(16)
+                ax.yaxis.get_offset_text().set_fontsize(16)
+                xmin = np.nanmin(xvals)
+                xmax = np.nanmax(xvals)
+                ax.set_xlim(1.05 * xmin - 0.05 * xmax, 1.05 * xmax - 0.05 * xmin)
+                ax.spines['right'].set_visible(False)
+                ax.spines['top'].set_visible(False)
+        for j in range(k):
+            axes[j, 0].set_ylabel(self.y_label[j].split('/')[0].strip(), fontsize=18)
+        for i in range(n):
+            axes[-1, i].set_xlabel(self.x_label[i], fontsize=20)
+        # 使用fig的坐标系统定位文本
+        fig.text(0.05, 0.5, '$SHAP$ $Value$ $for$', transform=fig.transFigure, fontsize=20,
+                 rotation=90, verticalalignment='center', horizontalalignment='left')
+        fig.subplots_adjust(hspace=0.3)
+        fig.show()
+
+    def shap_plot_mean(self, max_display: int = 5):  # TODO: 未绘制的特征作为一个单独柱状图
+        if self.shap_values is None:
+            raise ValueError("Before using SHAP values, \
+            please create by Plotter.shap_sample or Plotter.shap_load first")
+        m, n, k = self.shap_values.shape
+        n_disp = min(n, max_display)
+        shap_values = self.shap_values.values / self.shap_values.values.std(axis=(0, 1))
+        shap_value_mean = np.abs(shap_values).mean(axis=0)
+        feature_values = (self.shap_values.data - self.shap_values.data.mean(axis=0)) \
+                         / self.shap_values.data.std(axis=0)
+        feature_order = shap_value_mean.sum(axis=1).argsort()
+        fig, ax = plt.subplots()
+        # 绘制柱状图
+        y_pos = np.arange(n_disp)
+        patterns = (None, '\\\\', '++', 'xx', '////', '*', 'o', 'O', '.', '-')
+        total_width = 0.7
+        bar_width = total_width / k
+        for i in range(k):
+            y_pos_offset = ((k - 1) / 2 - i) * bar_width
+            ax.barh(y_pos + y_pos_offset, shap_value_mean[feature_order, i], bar_width,
+                    align='center', color=colors.red_rgb, hatch=patterns[i], edgecolor=(1, 1, 1, 0.8),
+                    label=self.y_label[i].split('/')[0].strip())
+        # 绘制柱状图的数据标签
+        xlim = ax.get_xlim()
+        bbox = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+        bbox_to_xscale = (xlim[1] - xlim[0]) / bbox.width
+        for i in range(k):
+            y_pos_offset = ((k - 1) / 2 - i) * bar_width
+            for j in range(n_disp):
+                ind = feature_order[j]
+                ax.text(shap_value_mean[ind, i] + (5 / 72) * bbox_to_xscale, y_pos[j] + y_pos_offset,
+                        '+ $%0.02f$' % shap_value_mean[ind, i], color=colors.red_rgb, fontsize=16,
+                        horizontalalignment='left', verticalalignment='center')
+        # 在每个特征处绘制一条水平线
+        for i in range(n_disp):
+            ax.axhline(i, color="#888888", lw=0.5, dashes=(1, 5), zorder=-1)
+        # 绘制细节设置
+        ax.set_yticks(y_pos, [self.x_label[ind].split('/')[0].strip() for ind in feature_order], fontsize=20)
+        ax.yaxis.set_ticks_position('none')
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False)
+        ax.set_xlabel("$mean$(|$SHAP$ $value$|)", fontsize=20)
+        ax.legend(loc='lower right', fontsize=18)
+        fig.show()
+
+
+def train_net(net_type: Type, data_in: torch.Tensor, data_out: torch.Tensor,
+              test_row: Iterable[int] = None, data_in_extra: torch.Tensor = None,
+              net_args: dict = None, thread_n: int = 1, n_per_thread: int = 1) -> List[BaseNetWrapper]:
     """批量训练多个同质学习器用于集成，可指定多进程"""
     net_n = thread_n * n_per_thread
     queue = Queue()
-    worker = []
-    for _ in range(thread_n):
-        p = Trainer(queue, data_in, data_out, net_type=net_type,
-                    test_row=test_row, data_in_extra=data_in_extra,
-                    net_n=n_per_thread, lr=5e-3, max_epochs=500, verbose=False)
-        p.start()
-        worker.append(p)
     net_list = []
-    while True:
-        ret = queue.get()
-        if ret[0] == 'error':
-            _, string = ret
-            print(string, file=sys.stderr)
-        elif ret[0] == 'net':
-            _, net, epoch = ret
+    if thread_n == 1:
+        # 使用主进程训练
+        p = Trainer(queue, data_in, data_out, net_type=net_type, net_args=net_args,
+                    test_row=test_row, data_in_extra=data_in_extra, net_n=n_per_thread,
+                    lr=2e-3, max_epochs=500, verbose=True)
+        t = Thread(target=p.run)
+        t.start()
+        for _ in range(net_n):
+            _, net, epoch = queue.get()
             net_list.append(net)
             print(f"[Net {len(net_list)}/{net_n}] Train epochs: {epoch}")
-            if len(net_list) == net_n:
-                break
-        else:
-            pass
+    else:
+        # 启动多进程训练
+        worker = []
+        for _ in range(thread_n):
+            p = Trainer(queue, data_in, data_out, net_type=net_type, net_args=net_args,
+                        test_row=test_row, data_in_extra=data_in_extra, net_n=n_per_thread,
+                        lr=2e-3, max_epochs=500, verbose=False)
+            p.start()
+            worker.append(p)
+        while True:
+            ret = queue.get()
+            if ret[0] == 'error':
+                print(ret[1], file=sys.stderr, end='')
+            elif ret[0] == 'info':
+                print(ret[1], file=sys.stdout, end='')
+            elif ret[0] == 'net':
+                _, net, epoch = ret
+                net_list.append(net)
+                print(f"[Net {len(net_list)}/{net_n}] Train epochs: {epoch}")
+                if len(net_list) == net_n:
+                    break
+            else:
+                pass
+    queue.close()
     return net_list
 
 
-def finetune_net(finetune_layer, data_in, data_out, test_row, *nets, data_in_extra=None, thread_n=1) -> list:
-
+def finetune_net(finetune_layer: Union[str, List[str]], data_in: torch.Tensor, data_out: torch.Tensor,
+                 *nets: BaseNetWrapper, test_row: Iterable[int] = None, data_in_extra: torch.Tensor = None,
+                 thread_n: int = 1) -> List[BaseNetWrapper]:
     class SendNet(Thread):
 
         def __init__(self, queue, *nets):
@@ -1095,19 +1292,22 @@ def save_net(path: str, *nets: nn.Module, desc: Any = None) -> None:
         print(f"{len(nets)} net(s) of {int(os.path.getsize(path) / 1024)} KB saved to '{path}'")
 
 
-def load_net(path: str) -> list:
+def load_net(path: str) -> List[nn.Module]:
     """从文件中载入网络"""
     obj = torch.load(path)
     print(f"Load net: '{obj['desc']}' (created at {obj['date']})")
     return obj['nets']
 
 
-def test_data(mesh='150'):
+def test_data(mesh='150', extra_in=False):
     """读取等效喉径0.2的塞式喷管数据集"""
     # 读取特定网格下的计算结果
-    data = pd.read_excel(r".\plug_result_mesh.xlsx", sheet_name=mesh)
+    data = pd.read_excel(r"./plug_result_mesh.xlsx", sheet_name=mesh)
     print(data.columns)
-    data_in = torch.tensor(data[['inlet_p', 'atmo_p', 'report-def-continuity']].to_numpy())
+    if extra_in:
+        data_in = torch.tensor(data[['inlet_p', 'atmo_p', 'Qm_max', 'Cf_max', 'report-def-continuity']].to_numpy())
+    else:
+        data_in = torch.tensor(data[['inlet_p', 'atmo_p', 'report-def-continuity']].to_numpy())
     data_out = torch.tensor(data[['Cf']].to_numpy())  # 单输出用于堆叠网络
     data_out_all = torch.tensor(data[['report-def-massflow', 'report-def-thrust', 'Cf', 'SpecImpulse']].to_numpy())
     noise_index = [-1]
@@ -1132,6 +1332,157 @@ def test_data(mesh='150'):
                                torch.zeros(X.shape[0] * X.shape[1])]).type(dtype=torch.float64).T
 
     return data, data_in, data_out, data_out_all, data_extra
+
+
+def test_compare():
+    """网络拟合能力和传统代理模型方法的对比（径向基函数、克里金等）"""
+    data, data_in, data_out, data_out_all, _ = test_data()
+
+    _data_in = data_in[:, : -1].numpy()  # 训练神经网络后值会被改变，原因未知
+    _data_out = data_out.flatten().numpy()  # 同上
+    data_in_scale = normalize(_data_in, type='minmax')
+    data_in_std = data_in_scale[0](_data_in)
+
+    # 计算训练集误差
+    err_ = np.zeros(7)
+    #err_rbf, err_gpr, err_lwlr, err_fcn, err_fcn_bag, err_dn, err_dn_bag = 0, 0, 0, 0, 0, 0, 0
+    # 径向基函数网络
+    rbf = RBF(data_in_std.T, data_out)
+    rbf.train(10)
+    err_[0] = np.abs(rbf.regress(data_in_std.T) / _data_out - 1).mean()
+    # 局部加权线性回归
+    lwlr = CurveFitting(data_out.flatten().tolist(), *data_in_std.T)
+    lwlr.Regress(k=0.5, show=False)
+    for i in range(len(data)):
+        err_[2] += np.abs(lwlr.Estimate(data_in_std[i].tolist()) / _data_out[i] - 1)
+    err_[2] /= len(data)
+    # 全连接网络
+    fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                    test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=4)
+    err_[3] = Plotter(data_in, data_out, *fcn).score()[0]
+    # 全连接网络集成
+    # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    #                  test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
+    # err_[4] = Plotter(data_in, data_out, *fcn2).score()[0]
+    # 去噪网络
+    dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                   test_row=[], net_args={'hidden_n': 15}, thread_n=4)
+    err_[5] = Plotter(data_in, data_out, *dn).score()[0]
+    # 去噪网络集成
+    # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    #                 test_row=[], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
+    # err_[6] = Plotter(data_in, data_out, *dn2).score()[0]
+    print("Average error:", *err_, sep='\n')
+
+    # 留一法计算测试集误差
+    err = np.zeros((len(data), 7))
+    for i in range(len(data)):
+        print("Test for sample %d ..." % i)
+        train_row = np.ones(len(data), dtype=bool)
+        train_row[i] = False
+        x_test = data_in_std[i][:, np.newaxis]
+        # 径向基函数网络
+        rbf = RBF(data_in_std[train_row].T, data_out[train_row])
+        rbf.train(10)
+        err[i, 0] = np.abs(rbf.regress(x_test).item() / data_out[i].item() - 1)
+        # 高斯过程回归（克里金）
+        gpr = GPR(data_in_std[train_row].T, data_out[train_row], sigma=0.6)
+        err[i, 1] = np.abs(gpr.regress(x_test)[0].item() / data_out[i].item() - 1)
+        # 局部加权线性回归
+        lwlr = CurveFitting(data_out.flatten()[train_row].tolist(), *data_in_std[train_row].T)
+        lwlr.Regress(k=0.5, show=False)
+        err[i, 2] = np.abs(lwlr.Estimate(x_test.flatten().tolist()) / data_out[i].item() - 1)
+        # 全连接网络
+        fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                        test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=4)
+        err[i, 3] = np.abs(Plotter(data_in, data_out, *fcn).result()[0][i].item() / data_out[i].item() - 1)
+        # 全连接网络集成
+        # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+        #                  test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
+        # err[i, 4] = np.abs(Plotter(data_in, data_out, *fcn2).result()[0][i].item() / data_out[i].item() - 1)
+        # 去噪网络
+        dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                       test_row=[i], net_args={'hidden_n': 15}, thread_n=4)
+        err[i, 5] = np.abs(Plotter(data_in, data_out, *dn).result()[0][i].item() / data_out[i].item() - 1)
+        # 去噪网络集成
+        # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+        #                 test_row=[i], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
+        # err[i, 6] = np.abs(Plotter(data_in, data_out, *dn2).result()[0][i].item() / data_out[i].item() - 1)
+    print("Average error (LOO):", *err.mean(axis=0), sep='\n')
+
+    pass
+
+
+def test_compare_with_lwlr():
+    """网络拟合能力和传统LWLR方法的对比"""
+    data, data_in, data_out, data_out_all, _ = test_data()
+
+    n = 100
+    lw = 1.5
+    mean = data_in.mean(dim=0)
+    left = 1.2 * data_in.min(dim=0)[0] - 0.2 * data_in.max(dim=0)[0]
+    right = 1.2 * data_in.max(dim=0)[0] - 0.2 * data_in.min(dim=0)[0]
+    x_0 = torch.vstack([torch.linspace(left[0], right[0], n), mean[1] * torch.ones(n), torch.zeros(n)]).T
+    x_1 = torch.vstack([mean[0] * torch.ones(n), torch.linspace(left[1], right[1], n), torch.zeros(n)]).T
+    distance = ((data_in - mean) / data_in.std(dim=0))[:, : -1]
+
+    # denoise net (2 + 1 -> 4)
+    nets = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out_all, test_row=[], thread_n=3)
+    fig, axes = plt.subplots(1, 2, figsize=(8, 6), sharey='row')
+    for i, net in enumerate(nets, start=1):
+        data_out_hat = net.forward(data_in)
+        error = torch.mean(torch.abs(data_out_hat - data_out_all) / data_out_all)
+        axes[0].plot(x_0[:, 0], net.forward(x_0)[:, 2].detach(), linewidth=lw)
+        axes[1].plot(x_1[:, 1], net.forward(x_1)[:, 2].detach(), linewidth=lw,
+                     label=f'net{i} (${error.item() * 100:.3f}$%)')
+    for i, ax in enumerate(axes):
+        _distance = distance.clone()
+        _distance[:, i] = 0.
+        ax.scatter(data_in[:, i], data_out, s=16, c=torch.linalg.norm(_distance, axis=1), cmap='viridis')
+        ax.autoscale()
+        ax.grid()
+    axes[1].legend()
+    axes[0].set_xlabel('$p_0$ / $Pa$')
+    axes[1].set_xlabel('$p_B$ / $Pa$')
+    axes[0].set_ylabel('$C_f$')
+    fig.tight_layout()
+    fig.show()
+
+    # lwlr (2 -> 1)
+    data_in = data_in[:, : -1].numpy()
+    data_out = data_out.flatten().numpy()
+    data_in_scale = normalize(data_in, type='minmax')
+    x_0_std = data_in_scale[0](x_0[:, : -1].numpy())
+    x_1_std = data_in_scale[0](x_1[:, : -1].numpy())
+    data_in_std = data_in_scale[0](data_in)
+
+    fig, axes = plt.subplots(1, 2, figsize=(8, 6), sharey='row')
+    for k, line_style in zip([1.0, 0.5, 0.2], ['--', '-.', '-']):
+        curve = CurveFitting(data_out.tolist(), *data_in_std.T)
+        curve.Regress(k=k, show=False)
+        y, y_0, y_1 = [], [], []
+        for p in data_in_std:
+            y.append(curve.Estimate(list(p)))
+        error = np.mean(np.abs((np.array(y) - data_out) / data_out))
+        for i in range(n):
+            y_0.append(curve.Estimate(list(x_0_std[i])))
+            y_1.append(curve.Estimate(list(x_1_std[i])))
+        axes[0].plot(x_0[:, 0], np.array(y_0), line_style, linewidth=lw)
+        axes[1].plot(x_1[:, 1], np.array(y_1), line_style, linewidth=lw,
+                     label=f'k={k:.1f} (${error * 100:.3f}$%)')
+    for i, ax in enumerate(axes):
+        _distance = data_in_std.copy()
+        _distance[:, i] = 0.
+        ax.scatter(data_in[:, i], data_out, s=16, c=np.linalg.norm(_distance, axis=1), cmap='viridis')
+        ax.autoscale()
+        ax.grid()
+    axes[1].legend()
+    axes[0].set_xlabel('$p_0$ / $Pa$')
+    axes[1].set_xlabel('$p_B$ / $Pa$')
+    axes[0].set_ylabel('$C_f$')
+    fig.tight_layout()
+    fig.show()
+    pass
 
 
 def test_trainer():
@@ -1167,10 +1518,10 @@ def test_trainer():
     plotter.plot(in_i=0, out_i=2, margin=0.1, section=[np.nan, 8325., np.nan], interp_i=2,
                  x_label="$p_0$ / $Pa$", y_label="$C_f$")
     plotter.plot(in_i=1, out_i=2, margin=0.1, section=[6e6, np.nan, np.nan], interp_i=2,
-                 x_label="$p_e$ / $Pa$", y_label="$C_f$")
-    plotter.plot_all(x_label=["$p_0$ / $Pa$", "$p_e$ / $Pa$", "$R_m$"],
+                 x_label="$p_B$ / $Pa$", y_label="$C_f$")
+    plotter.plot_all(x_label=["$p_0$ / $Pa$", "$p_B$ / $Pa$", "$R_m$"],
                      y_label=["$Q_m$ / $kg·s^{-1}$", "$F$ / $N$", "$C_f$", "$I_s$"])
-    plotter.plot_all(x_label=["$p_0$ / $Pa$", "$p_e$ / $Pa$", "$R_m$"],
+    plotter.plot_all(x_label=["$p_0$ / $Pa$", "$p_B$ / $Pa$", "$R_m$"],
                      y_label=["$Q_m$ / $kg·s^{-1}$", "$F$ / $N$", "$C_f$", "$I_s$"],
                      section=[np.nan, np.nan, noise])
     plotter.plot3d(out_i=2)
@@ -1216,18 +1567,52 @@ def test_finetuner():
     test_row = np.setdiff1d(np.arange(len(data_f_in)), train_row)
     print("Train sample:\n" + '\n'.join(map(lambda row: f"\t{row[0]}\t{row[1]}", data_f_in[train_row])))
 
-    nets1200_1 = load_net(r'./nets/DenoiseNet1200(4+1~1,full,10x4x3,512).pth')
-    nets1200_2 = load_net(r'./nets/DenoiseNet1200(4+1~1,part,10x4x3,512).pth')
+    nets1200_1 = load_net(r'./nets/DenoiseNet1200(4+1~1,part,10x4x3,512).pth')
+    nets1200_2 = load_net(r'./nets/DenoiseNet1200(4+1~1,few,10x4x3,512).pth')
+    netsTL = load_net(r'./nets/DenoiseNetTL(4+1~1,part,10x4x3,512).pth')
 
     nets = load_net(r'./nets/DenoiseNet(4+1~1,part,10x4x3,512).pth')
     print("Net parameters:")
     for name, param in nets[0].named_parameters():
         print('\t' + name)
 
+    # 测试NetTL的误差和去噪性能
+    plotter = Plotter(data_f_in, data_f_out, *netsTL)
+    cf = plotter.result()[0][-4]
+    print(cf, 100 * (cf / 1.80058941622812 - 1))  # 和离群点修正值的相对误差
+    cf = plotter.result(noise_i=[2])[0][-4]
+    print(cf, 100 * (cf / 1.80058941622812 - 1))
+    print(100 * plotter.score()[0], 100 * plotter.score(noise_i=[2])[0])
+
+    # 数据增强：糙网格结果迁移至细网格（修改自Plotter.plot_error）
+    plotter = Plotter(data_f_in, data_f_out, *netsTL)
+    x = np.arange(len(plotter.data_in))
+    y = plotter.data_out[:, 0]
+    y_coarse = data_out[np.setdiff1d(np.arange(len(data_out)), [7, 12, 13, 14, 20]), 0]
+    fig = plt.figure(figsize=(12, 8))
+    gs = GridSpec(3, 1, figure=fig)
+    ax1 = fig.add_subplot(gs[:2, 0])
+    ax2 = fig.add_subplot(gs[2, 0])
+    y_hat, y_hat_std = plotter.result(out_i=0)
+    y_error = 100 * torch.abs(y_hat / y - 1)
+    ax1.plot(x, y_hat, 'b.-', label="$fitting$")
+    ax1.fill_between(x, y_hat - 2 * y_hat_std, y_hat + 2 * y_hat_std,
+                     facecolor='blue', alpha=0.2)
+    ax2.bar(x, y_error, color='dodgerblue')
+    ax1.plot(x, y_coarse, '.-', c='gray', alpha=0.6, label="$coarse$")
+    ax1.plot(x, y, 'k.-', label="$origin$")
+    ax1.set_xticklabels([])
+    ax2.set_xlabel("$case_i$", fontsize=20)
+    ax1.set_ylabel("$C_f$", fontsize=20)
+    ax2.set_ylabel(f"$error$ $of$ $C_f$ %", fontsize=20)
+    ax1.legend(loc='lower right', fontsize=18)
+    fig.tight_layout()
+    fig.show()
+
     # 收敛曲线比较
     queue = Queue()
     trainer1 = Trainer(queue, data_f_in, data_f_out, net_type=DenoisePhysInStackWrapper,
-                       test_row=[], net_n=1, verbose=True)
+                       test_row=[1, 8, 18], lr=1e-3, net_n=1, verbose=True)
     trainer1.run()
     _, net1, _ = queue.get()
     trainer2 = Trainer(queue, data_f_in, data_f_out, net_type=DenoisePhysInStackWrapper,
@@ -1246,21 +1631,22 @@ def test_finetuner():
     tuner.plot_loss()
     fig, ax = plt.subplots()
     data_1 = np.array(trainer1.loss_history).T
-    ax.plot(data_1[0], data_1[1], 'r--', linewidth=1)
-    ax.plot(data_1[0], data_1[2], 'r-', linewidth=1, label="$262w,$ $19$")
+    ax.plot(data_1[0], data_1[1], 'r--', linewidth=1.5)
+    ax.plot(data_1[0], data_1[2], 'r-', linewidth=1.5, label="$262w,$ $19$")
     data_2 = np.array(trainer2.loss_history).T
-    ax.plot(data_2[0], data_2[1], 'b--', linewidth=1)
-    ax.plot(data_2[0], data_2[2], 'b-', linewidth=1, label="$262w,$ $4$")
+    ax.plot(data_2[0], data_2[1], 'b--', linewidth=1.5)
+    ax.plot(data_2[0], data_2[2], 'b-', linewidth=1.5, label="$262w,$ $4$")
     data_3 = np.array(tuner.loss_history).T
     data_3 = np.hstack([data_3, np.vstack([np.arange(200, 500),
                                            np.ones(300) * data_3[1, -1],
                                            np.ones(300) * data_3[2, -1]])])
-    ax.plot(data_3[0], data_3[1], 'g--', linewidth=1)
-    ax.plot(data_3[0], data_3[2], 'g-', linewidth=1, label="$4.4w,$ $4$ $(TL)$")
+    ax.plot(data_3[0], data_3[1], 'g--', linewidth=1.5)
+    ax.plot(data_3[0], data_3[2], 'g-', linewidth=1.5, label="$4.4w,$ $4$ $(TL)$")
     ax.set_yscale('log')
-    ax.set_xlabel("$Epoch$")
-    ax.set_ylabel("$Loss$")
-    ax.legend(loc='lower right')
+    ax.set_yticks([10**(-2*i) for i in range(6)])
+    ax.set_xlabel("$Epoch$", fontsize=20)
+    ax.set_ylabel("$Loss$", fontsize=20)
+    ax.legend(loc='lower right', fontsize=18)
     ax.grid()
     plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']  # 用来正常显示指数坐标系标签
     fig.show()
@@ -1276,7 +1662,7 @@ def test_finetuner():
     train_net(DenoisePhysInStackWrapper, data_f_in, data_f_out, test_row=test_row, thread_n=8, n_per_thread=64)
     t2 += time.time()
     t3 = -time.time()
-    nets_f = finetune_net('net.linear_out', data_f_in, data_f_out, test_row, *nets, thread_n=8)
+    nets_f = finetune_net('net.linear_out', data_f_in, data_f_out, *nets, test_row=test_row, thread_n=8)
     t3 += time.time()
     print(f"Training Time Board (sec):\n\tAll data: {t1:.0f}\n\tPart data: {t2:.0f}\n\tPart data (finetune): {t3:.0f}")
 
@@ -1350,6 +1736,61 @@ def test_denoise_plot(full_train=True):
         nets = load_net(r'./nets/DenoiseNet(4+1~4p,part,10x4x3,512).pth')
     plotter = Plotter(data_in, data_out_all, *nets)
     plotter.plot_error(out_i=0, noise_i=[2], y_label="$C_f$")
+    pass
+
+
+def test_explain_model(n_sample=200, exclude_phy=True):
+    """基于Shapley值理论的黑盒白化
+
+    注意：绘制单样本夏普利值的waterfull图时，请设置plt.rcParams['font.sans-serif'] = ['Microsoft YaHei']
+    """
+
+    # 读取数据集和网络
+    data, data_in, data_out, data_out_all, _ = test_data(extra_in=True)
+    nets = load_net(r'./nets/DenoiseNet(4+1~4,full,10x4x3,512).pth')
+
+    # 剔除网络的自动物理输入
+    _extra_input = nets[0]._extra_input
+    mapper = lambda x: np.hstack([x, _extra_input(torch.tensor(x))])
+    for net in nets:
+        net._extra_input = lambda x: BaseNetWrapper._extra_input(None, x)
+        net.in_channels += 2
+
+    # 计算SHAP值
+    rm_mean = data_in[:, -1].mean().item()
+    rm_std = data_in[:, -1].std().item()
+    data_in = data_in[:, [0, 1, 4, 2, 3]]
+    plotter = Plotter(data_in, data_out_all, *nets,
+                      x_label=["$p_0$ / $Pa$", "$p_B$ / $Pa$", "$R_m$", "$Q_{m,max}$", "$C_{f,max}$"],
+                      y_label=["$Q_m$ / $kg·s^{-1}$", "$F$ / $N$", "$C_f$", "$I_s$"])
+    plotter.shap_load(r'F:\Nozzle\OpenFOAM\nets\Shapley200p_DenoiseNet(4+1~4,full,10x4x3,512).dat')
+    if exclude_phy:
+        plotter.shap_sample(n_sample=n_sample,
+                            bounds=[(1.3e6, 21.7e6), (0., 91225), (-rm_std, rm_std), (90, 1482), (1.36, 2.28)])
+    else:
+        plotter.shap_sample(n_sample=n_sample, mapping=mapper, mapping_dim=3,
+                            bounds=[(1.3e6, 21.7e6), (0., 91225), (-rm_std, rm_std)])
+    # plotter.shap_save(r'F:\Nozzle\OpenFOAM\nets\Shapley200_DenoiseNet(4+1~4,full,10x4x3,512).dat')
+
+    # 可视化分析
+    shap_values = plotter.shap_values
+    shap_values_std = shap_values.values.std(axis=(0, 1))
+    shap.plots.force(shap_values[:, :, 2])
+    shap.plots.bar(shap_values[:, :, 2])
+    shap.plots.bar({tag: shap_values[:, :, i] / shap_values_std[i]
+                    for i, tag in enumerate(['Q_m', 'F', 'C_f', 'I_s'])})
+    shap.plots.beeswarm(shap_values[:, :, 2])
+    shap.plots.scatter(shap_values[:, 0, 2], color=shap_values[:, :, 2])
+    shap.plots.heatmap(shap_values[:, :, 2])
+    shap.plots.waterfall(shap_values[0, :, 0])
+
+    for i in range(4):
+        for j in range(5):
+            shap.plots.scatter(shap_values[:, j, i], color=shap_values[:, :, i])
+            plt.savefig(r'.\展示\Denoise\shapley\scatter_%d_%d.png' % (i + 1, j + 1))
+            plt.close()
+
+    plotter.plot_all(section=[np.nan, np.nan, rm_mean, np.nan, np.nan])
     pass
 
 
@@ -2400,10 +2841,13 @@ def test_bagging():
 
 
 if __name__ == '__main__':
-    # test_trainer()
+    # test_compare()
+    # test_compare_with_lwlr()
+    test_trainer()
     # test_arch_plot()
     # test_denoise_plot()
-    test_finetuner()
+    # test_finetuner()
+    # test_explain_model()
     # test_denoise()
     # test_pi_denoise()
     pass
