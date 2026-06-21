@@ -1,0 +1,111 @@
+# CFD-Post Session File (CFX-21.1)
+
+# 批处理cfdpost脚本模板
+
+
+COMMAND FILE:
+  CFX Post Version = 22.1
+END
+
+!$cwd = "{ROOTPATH}";
+!$data_file = "$cwd/{DATAFILE}";
+!$res_file = "$cwd/result.txt";
+!$pic_file = "$cwd/machNumber.png";
+
+!$local_datestring = localtime();
+!print "[", $local_datestring, "] CFD-Post CCL script starts running.\n";
+
+
+!sub CreatePlanes {
+  PLANE:Symmetry
+    Domain List = /DOMAIN GROUP:All Domains
+    Option = XY Plane
+    Plane Bound = None
+    Plane Type = Slice
+    Range = Global
+    X = 0.0 [mm]
+    Y = 0.0 [mm]
+    Z = 0.0 [mm]
+  END
+  > hide /PLANE:Symmetry
+!}
+
+
+!sub CalcResult {
+  !use Math::Trig;
+  !($force, $units) = evaluate('- (force_x()@inlet + force_x()@wall)');
+  !($p0, $units) = evaluate('areaAve(Pressure + 0.5*Density*Velocity*Velocity)@inlet');
+  !$cf = $force / ({At} * $p0);
+  !($massflow, $units) = evaluate('areaInt(Density * Velocity u)@inlet');
+  !$specImp = $force / (9.80665 * $massflow);
+  !open FOS, ">$res_file";
+  !print FOS "$force $cf $specImp\n";
+  !close FOS;
+!}
+
+
+!sub SavePicture {
+  USER SCALAR VARIABLE:Mach Number
+    Boundary Values = Conservative
+    Calculate Global Range = On
+    Recipe = Expression
+    Expression = Velocity / sqrt({gamma_R} * Temperature)
+    Variable to Copy = Pressure
+    Variable to Gradient = Pressure
+  END
+  CONTOUR:MachNumber
+    Domain List = /DOMAIN GROUP:All Domains
+    Location List = Symmetry
+    Colour Variable = Mach Number
+    Contour Range = Global
+    Number of Contours = 200
+    Draw Contours = Off
+    Lighting = On
+  END
+  > show /CONTOUR:MachNumber, view=/VIEW:View 1
+  DEFAULT LEGEND:Default Legend View 1
+    Legend Orientation = Vertical
+    Legend Title = Legend
+    Legend Title Mode = Variable
+    Legend X Justification = Left
+    Legend Y Justification = Center
+    Legend Size = 0.8
+    Legend Aspect = 0.05
+    Legend Format = %5.2f
+  END
+  HARDCOPY:
+    Antialiasing = Off
+    Hardcopy Filename = default.png
+    Hardcopy Format = png
+    Hardcopy Tolerance = 0.0001
+    Image Width = 1920
+    Image Height = 1080
+    Image Scale = 100
+    JPEG Image Quality = 80
+    Screen Capture = Off
+    Use Screen Size = Off
+    White Background = On
+  END
+  VIEW:View 1
+    Camera Mode = User Specified
+    CAMERA:
+      Option = Pivot Point and Quaternion
+      Pivot Point = 2.25, 0.75, 0
+      Scale = 0.55
+      Pan = 0, 0
+      Rotation Quaternion = 0, 0, 0, 1
+    END
+  END
+  > print $pic_file, view=/VIEW:View 1
+!}
+
+
+!print "Loading case {DATAFILE} from {ROOTPATH} ...\n";
+
+> load filename=$data_file
+!CreatePlanes();
+!CalcResult();
+!SavePicture();
+
+!$local_datestring = localtime();
+!print "[", $local_datestring, "] CFD-Post CCL script finished.\n";

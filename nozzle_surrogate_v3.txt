@@ -1,0 +1,87 @@
+External plug config:
+	Ma_e = 3.470
+	epsilon = 16.00
+	R_t = 7.961176e-01
+	h_t = 2.506081e-02
+	R_e = 8.000000e-01
+	r_t = 2.000000e-01
+Line division info:
+	ls_small =  6.847e-03
+	ls_middle =  1.780e-02
+	ls_large = 6.162e-02
+	n_total = 1010
+Info    : 2D Mesh has 30865 nodes and 62738 elements
+Info    : Writing '/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/plug_Rt2.00e-01_eps16.0_n150/plug.bdf'...
+Info    : Done writing '/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/plug_Rt2.00e-01_eps16.0_n150/plug.bdf'
+Script type: jou | Length: 3483 | Parameter Count: 8
+(ROOTPATH=None, Cp=None, K=None, M=None, inlet_p=None, atmo_p=None, inlet_t=None, inlet_area=None)
+Total 1 Fluent Jobs (16 threads, 2ddp solver)
+parameter group:
+	Cp	K	M	inlet_p	atmo_p	inlet_t	inlet_area
+	2837.76	0.242	20.9	13320000.0	101325	3500	3.0861424985884867
+Read existing result file: '/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/plug_Rt2.00e-01_eps16.0_n150/fluent_result.txt'
+1 samples and 230 points have been read. (point range: [-7.735e-01, 2.658e+00])
+Cf_baseline / Cf_max =  1.0006517778018085
+[Surr] use 1023/1053 nozzle data to train surrogate model
+[Surr] Preprocessed data (r_t=2.000e-01, epsilon=16.0, spline_n=7) has been saved to '/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/nozzle_data_selected.pth'
+[Surr] hidden dimension of sensor: 16
+Wed Jan 21 13:42:07 2026
+training on cuda ...
+[ConvolutionSensor Profile] MACs: 22.26K; Total params: 5.51K
+[SensorDecoder Profile] MACs: 0.10M; Total params: 0.10M
+Epoch 1: average loss 0.047, single loss [0.0468] (2517.2 examples/sec)
+...
+Epoch 600: average loss 0.001, single loss [0.00057] (3408.1 examples/sec)
+Total training time: 0.1 h
+Last learning rate: 2.50e-01
+[Surr] sensor training finished (loss: 5.748e-04, time: 2.65e+02 s)
+[Surr] backbone: 8 channels -> 18 channels
+DenoiseWrapper(
+  (net): DenoiseNet(
+    (residual): Sequential(
+      (0): ResidualBlock(
+        (linear_up): Linear(in_features=32, out_features=128, bias=True)
+        (linear_down): Linear(in_features=128, out_features=32, bias=True)
+        (dropout): Dropout(p=0.0, inplace=False)
+      )
+      (1): ResidualBlock(
+        (linear_up): Linear(in_features=32, out_features=128, bias=True)
+        (linear_down): Linear(in_features=128, out_features=32, bias=True)
+        (dropout): Dropout(p=0.0, inplace=False)
+      )
+      (2): ResidualBlock(
+        (linear_up): Linear(in_features=32, out_features=128, bias=True)
+        (linear_down): Linear(in_features=128, out_features=32, bias=True)
+        (dropout): Dropout(p=0.0, inplace=False)
+      )
+      (3): ResidualBlock(
+        (linear_up): Linear(in_features=32, out_features=128, bias=True)
+        (linear_down): Linear(in_features=128, out_features=32, bias=True)
+        (dropout): Dropout(p=0.0, inplace=False)
+      )
+      (4): ResidualBlock(
+        (linear_up): Linear(in_features=32, out_features=128, bias=True)
+        (linear_down): Linear(in_features=128, out_features=32, bias=True)
+        (dropout): Dropout(p=0.0, inplace=False)
+      )
+    )
+    (linear_in): Linear(in_features=8, out_features=32, bias=True)
+    (linear_out): Linear(in_features=32, out_features=18, bias=True)
+  )
+  (loss_f): SmoothL1Loss()
+)
+Arch: DenoiseWrapper
+MACs: 41.8K
+Total params: 42.6K
+Epoch 1: train loss 0.1608 , test loss 1.608e-01
+...
+Epoch 500: train loss 0.0042 , test loss 4.166e-03
+[Net 1/16] Train epochs: 500
+...
+[Net 16/16] Train epochs: 500
+[Surr] main network training finished (error: 3.69e+01 ± 1.78e+01 %, time: 2.98e+03 s)
+Epoch 1: average train loss 0.0088, single test loss [0.007, 0.008, 0.0023, 0.0018, 0.0075, 0.0211]
+...
+Epoch 200: average train loss 0.0036, single test loss [0.0029, 0.0034, 0.0001, 0.0003, 0.0033, 0.0108]
+[Surr] surrogate finetuning finished (value loss: 0.008 -> 0.003, field loss: 0.012 -> 0.004, time: 3.17e+02 s)
+Save surrogate model of PlugSplineEnv to '/home/zhuofeng/lgq/OpenFOAM/test/FluentWithDL/nozzle_surrogate_v3.pth'

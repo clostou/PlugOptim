@@ -5,6 +5,8 @@
 """
 
 import sys
+import time
+import threading
 import numpy as np
 from scipy.optimize import root_scalar
 
@@ -16,6 +18,24 @@ from cfd_toolbox.vec import offset_space, func_space_2d, ThirdPoly, BSpline, Cub
 import gmsh
 
 __all__ = ['External', 'ExternalSpine', 'profile_to_msh']
+
+
+def run_with_timeout(func, timeout, *args, **kwargs):
+    """带超时的函数执行，不包含返回值"""
+
+    # 创建并启动线程（设置为守护线程，主线程退出时会自动结束）
+    thread = threading.Thread(target=func, args=args, kwargs=kwargs, daemon=True)
+    thread.start()
+
+    if timeout:
+        # 等待线程完成或超时
+        start_time = time.time()
+        while thread.is_alive():
+            time.sleep(0.1)  # 短暂休眠，避免CPU占用过高
+            if time.time() - start_time > timeout:
+                raise TimeoutError(f"Function {func.__name__} timed out after {timeout} seconds")
+    else:
+        thread.join()
 
 
 class External:
@@ -559,7 +579,8 @@ def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_pat
             gmsh.model.addPhysicalGroup(1, curve[ind: ind + n], name=name)
             ind += n
         # 网格生成
-        gmsh.model.mesh.generate(2)
+        run_with_timeout(gmsh.model.mesh.generate, 10, 2)
+        # gmsh.model.mesh.generate(2)  # 二次报错会导致卡死
     else:
         ov = gmsh.model.geo.revolve([(2, s)], 0, 0, 0, 1, 0, 0, np.pi * 3 / 180, [1], recombine=True)
         gmsh.model.geo.synchronize()
@@ -574,7 +595,8 @@ def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_pat
                 gmsh.model.addPhysicalGroup(2, [s[1] for s in ov[ind: ind + n]], name=name)
                 ind += n
         # 网格生成
-        gmsh.model.mesh.generate(3)
+        run_with_timeout(gmsh.model.mesh.generate, 10, 3)
+        # gmsh.model.mesh.generate(3)
     if not verbose:
         mesh_summary(2 if planner else 3)
         gmsh.option.setNumber('General.Terminal', 1)
@@ -598,10 +620,13 @@ def profile_to_msh(profile_points, partition_tag, lc=0.1, planner=True, save_pat
 
 
 if __name__ == '__main__':
-    '''plug = External(epsilon=16, r_t=0.2)
-    plug.derive()
-    plug.generate(n=150, factor=6)
-    '''
+    # plug = External(epsilon=16, r_t=0.2)
+    # plug.derive()
+    # plug.generate(n=150, factor=6)
+    # plug_div = plug.profile['plug_div']
+    # plug_div[:, 1] = - plug_div[:, 1]
+    # np.savetxt(r'.\plug_div.txt', plug_div, delimiter=",", fmt='%.18e')
+
     plug = External(epsilon=1.5625, r_t=1)
     plug.derive()
     plug.generate(n=90, factor=None)

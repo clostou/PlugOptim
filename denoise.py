@@ -56,10 +56,10 @@ class ResidualBlock(nn.Module):
 
 class DenoiseNet(nn.Module):
 
-    def __init__(self, input_channels, num_channels, output_channels, block_n=3, block_multiply=4):
+    def __init__(self, input_channels, num_channels, output_channels, block_n=3, block_multiply=4, dropout=0.0):
         super(DenoiseNet, self).__init__()
         self.block_n = block_n
-        self.residual = nn.Sequential(*[ResidualBlock(num_channels, block_multiply * num_channels, drop_p=0.0)
+        self.residual = nn.Sequential(*[ResidualBlock(num_channels, block_multiply * num_channels, drop_p=dropout)
                                         for _ in range(block_n)])
         self.linear_in = nn.Linear(input_channels, num_channels)
         self.linear_out = nn.Linear(num_channels, output_channels)
@@ -549,7 +549,8 @@ class Trainer(Process):
                  data_in: torch.Tensor, data_out: torch.Tensor,
                  net_type: Optional[Type] = DenoiseWrapper, net_args: dict = None,
                  test_row: Iterable[int] = None, data_in_extra: torch.Tensor = None,
-                 net_n: int = 1, lr: float = 5e-3, max_epochs: int = 500, verbose: bool = False):
+                 net_n: int = 1, lr: float = 5e-3, max_epochs: int = 500,
+                 seed: Optional[int] = None, verbose: bool = False):
         super(Trainer, self).__init__(name='NetTrainer', daemon=True)
         self.queue = queue
         self.data_in = data_in
@@ -561,6 +562,7 @@ class Trainer(Process):
         self.net_n = net_n  # 需要训练的网络数量
         self.lr = lr
         self.max_epochs = max_epochs
+        self.seed = seed
         self.verbose = verbose
         self.loss_history = []
 
@@ -585,6 +587,8 @@ class Trainer(Process):
     def run(self):
         """使用预设超参数，在给定的数据集上训练单个基学习器"""
         self.redirect()
+        if self.seed is not None:
+            torch.manual_seed(self.seed)
         if not issubclass(self.net_type, DenoiseWrapper):
             raise ValueError("Net for training should be same as or subclass of DenoiseWrapper (given %s)" \
                              % self.net_type)
@@ -611,7 +615,8 @@ class Trainer(Process):
                 print("Arch: %s" % self.net_type.__name__,
                       "MACs: %s" % num2str(flops),
                       "Total params: %s" % num2str(params), sep='\n')
-            optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, betas=(0.9, 0.999), weight_decay=0.00005)
+            # optimizer = torch.optim.Adam(net.parameters(), lr=self.lr, betas=(0.9, 0.999), weight_decay=0.00001)
+            optimizer = torch.optim.SGD(net.parameters(), lr=self.lr, momentum=0.9, weight_decay=0.00001)
             scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, milestones=[300], gamma=0.2)
             early_stopping = EarlyStopping(skip_epoch=self.max_epochs if len(test_row) == 0 else 200,
                                            patience=100, verbose=False)
@@ -921,7 +926,7 @@ class Plotter:
 
     def plot(self, in_i: int = 0, out_i: int = 0, n: int = 100, margin: float = 0.,
              interp_i: int = None, line_dim: int = None, section: Iterable[Any] = None,
-             x_label: str = None, y_label: str = None):
+             x_label: str = None, y_label: str = None, return_ax: bool = False):
         """在特定投影坐标面上绘制网络的拟合曲线"""
         x_label = self.x_label[in_i] if x_label is None else x_label
         y_label = self.y_label[out_i] if y_label is None else y_label
@@ -975,10 +980,13 @@ class Plotter:
         ax.autoscale()
         ax.legend()
         ax.grid()
-        fig.show()
+        if return_ax:
+            return fig, ax
+        else:
+            fig.show()
 
     def plot_all(self, n: int = 100, margin: float = 0., section: Iterable[float] = None,
-                 x_label: List[str] = None, y_label: List[str] = None):
+                 x_label: List[str] = None, y_label: List[str] = None, return_ax: bool = False):
         """在潜空间的原点截面上，绘制网络各个通道间的拟合曲线"""
         n_in = self.nets[0].in_channels
         n_out = self.nets[0].out_channels
@@ -1004,10 +1012,13 @@ class Plotter:
                     ax.set_ylabel(y_label[out_i], fontsize=20)
                 ax.autoscale()
                 ax.grid()
-        fig.show()
+        if return_ax:
+            return fig, axes
+        else:
+            fig.show()
 
     def plot3d(self, in_i: int = 0, in_j: int = 1, out_i: int = 0, n: int = 20,
-               margin: float = 0., section: Iterable[float] = None):
+               margin: float = 0., section: Iterable[float] = None, return_ax: bool = False):
         """指定两个输入维度和一个输出维度绘制拟合曲面的三维投影"""
         fig = plt.figure()
         ax = fig.add_subplot(111, projection='3d')
@@ -1024,7 +1035,10 @@ class Plotter:
                           rstride=2, cstride=2, alpha=0.6)'''
         ax.scatter(self.data_in[:, in_i], self.data_in[:, in_j], self.data_out[:, out_i],
                    s=16, c=distance, cmap='viridis')
-        plt.show()
+        if return_ax:
+            return fig, ax
+        else:
+            fig.show()
 
     def shap_sample(self, n_sample: int = 200, seed: int = 1, bounds: Iterable[Tuple[float, float]] = None,
                     mapping: Callable = None, mapping_dim: int = None):
@@ -1186,7 +1200,8 @@ class Plotter:
 
 def train_net(net_type: Type, data_in: torch.Tensor, data_out: torch.Tensor,
               test_row: Iterable[int] = None, data_in_extra: torch.Tensor = None,
-              net_args: dict = None, thread_n: int = 1, n_per_thread: int = 1) -> List[BaseNetWrapper]:
+              net_args: dict = None, thread_n: int = 1, n_per_thread: int = 1,
+              seed: Optional[int] = None) -> List[BaseNetWrapper]:
     """批量训练多个同质学习器用于集成，可指定多进程"""
     net_n = thread_n * n_per_thread
     queue = Queue()
@@ -1195,7 +1210,7 @@ def train_net(net_type: Type, data_in: torch.Tensor, data_out: torch.Tensor,
         # 使用主进程训练
         p = Trainer(queue, data_in, data_out, net_type=net_type, net_args=net_args,
                     test_row=test_row, data_in_extra=data_in_extra, net_n=n_per_thread,
-                    lr=2e-3, max_epochs=500, verbose=True)
+                    lr=2e-3, max_epochs=500, seed=seed, verbose=True)
         t = Thread(target=p.run)
         t.start()
         for _ in range(net_n):
@@ -1208,9 +1223,11 @@ def train_net(net_type: Type, data_in: torch.Tensor, data_out: torch.Tensor,
         for _ in range(thread_n):
             p = Trainer(queue, data_in, data_out, net_type=net_type, net_args=net_args,
                         test_row=test_row, data_in_extra=data_in_extra, net_n=n_per_thread,
-                        lr=2e-3, max_epochs=500, verbose=False)
+                        lr=2e-3, max_epochs=500, seed=seed, verbose=False)
             p.start()
             worker.append(p)
+            if seed is not None:  # 在Linux上不同进程应当指定不同随机数种子以防网络完全相同
+                seed += 1
         while True:
             ret = queue.get()
             if ret[0] == 'error':
@@ -1343,72 +1360,88 @@ def test_compare():
     data_in_scale = normalize(_data_in, type='minmax')
     data_in_std = data_in_scale[0](_data_in)
 
-    # 计算训练集误差
-    err_ = np.zeros(7)
-    #err_rbf, err_gpr, err_lwlr, err_fcn, err_fcn_bag, err_dn, err_dn_bag = 0, 0, 0, 0, 0, 0, 0
-    # 径向基函数网络
-    rbf = RBF(data_in_std.T, data_out)
-    rbf.train(10)
-    err_[0] = np.abs(rbf.regress(data_in_std.T) / _data_out - 1).mean()
-    # 局部加权线性回归
-    lwlr = CurveFitting(data_out.flatten().tolist(), *data_in_std.T)
-    lwlr.Regress(k=0.5, show=False)
-    for i in range(len(data)):
-        err_[2] += np.abs(lwlr.Estimate(data_in_std[i].tolist()) / _data_out[i] - 1)
-    err_[2] /= len(data)
-    # 全连接网络
-    fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-                    test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=4)
-    err_[3] = Plotter(data_in, data_out, *fcn).score()[0]
-    # 全连接网络集成
-    # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-    #                  test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
-    # err_[4] = Plotter(data_in, data_out, *fcn2).score()[0]
-    # 去噪网络
-    dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-                   test_row=[], net_args={'hidden_n': 15}, thread_n=4)
-    err_[5] = Plotter(data_in, data_out, *dn).score()[0]
-    # 去噪网络集成
-    # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-    #                 test_row=[], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
-    # err_[6] = Plotter(data_in, data_out, *dn2).score()[0]
-    print("Average error:", *err_, sep='\n')
+    data_in_clear = data_in.clone()  # 零噪声效果更差
+    data_in_clear[:, -1] = 0
+
+    # 测试网络结构 (BaseNetWrapper etc.)
+    net = BaseNetWrapper(2, 1, backbone='fc', hidden_n=42)
+    X = torch.rand(size=(1, net.in_channels), dtype=torch.float64)
+    print(profile(net, inputs=(X,), verbose=False))
+
+    net = BaseNetWrapper(2, 1, hidden_n=15)
+    X = torch.rand(size=(1, net.in_channels), dtype=torch.float64)
+    print(profile(net, inputs=(X,), verbose=False))
+
+    # # 计算训练集误差
+    # err_ = np.zeros(7)
+    # #err_rbf, err_gpr, err_lwlr, err_fcn, err_fcn_bag, err_dn, err_dn_bag = 0, 0, 0, 0, 0, 0, 0
+    # # 径向基函数网络
+    # rbf = RBF(data_in_std.T, data_out)
+    # rbf.train(n=10)
+    # err_[0] = np.abs(rbf.regress(data_in_std.T) / _data_out - 1).mean()
+    # # 局部加权线性回归
+    # lwlr = CurveFitting(data_out.flatten().tolist(), *data_in_std.T)
+    # lwlr.Regress(k=0.5, show=False)
+    # for i in range(len(data)):
+    #     err_[2] += np.abs(lwlr.Estimate(data_in_std[i].tolist()) / _data_out[i] - 1)
+    # err_[2] /= len(data)
+    # # 全连接网络
+    # fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    #                 test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=4)
+    # err_[3] = Plotter(data_in, data_out, *fcn).score()[0]
+    # # 全连接网络集成
+    # # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    # #                  test_row=[], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
+    # # err_[4] = Plotter(data_in, data_out, *fcn2).score()[0]
+    # # 去噪网络
+    # dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    #                test_row=[], net_args={'hidden_n': 15}, thread_n=4)
+    # err_[5] = Plotter(data_in, data_out, *dn).score()[0]
+    # # 去噪网络集成
+    # # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+    # #                 test_row=[], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
+    # # err_[6] = Plotter(data_in, data_out, *dn2).score()[0]
+    # print("Average error:", *err_, sep='\n')
 
     # 留一法计算测试集误差
-    err = np.zeros((len(data), 7))
+    err = np.zeros((len(data), 7, 10))
     for i in range(len(data)):
         print("Test for sample %d ..." % i)
         train_row = np.ones(len(data), dtype=bool)
         train_row[i] = False
         x_test = data_in_std[i][:, np.newaxis]
-        # 径向基函数网络
-        rbf = RBF(data_in_std[train_row].T, data_out[train_row])
-        rbf.train(10)
-        err[i, 0] = np.abs(rbf.regress(x_test).item() / data_out[i].item() - 1)
-        # 高斯过程回归（克里金）
-        gpr = GPR(data_in_std[train_row].T, data_out[train_row], sigma=0.6)
-        err[i, 1] = np.abs(gpr.regress(x_test)[0].item() / data_out[i].item() - 1)
-        # 局部加权线性回归
-        lwlr = CurveFitting(data_out.flatten()[train_row].tolist(), *data_in_std[train_row].T)
-        lwlr.Regress(k=0.5, show=False)
-        err[i, 2] = np.abs(lwlr.Estimate(x_test.flatten().tolist()) / data_out[i].item() - 1)
-        # 全连接网络
-        fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-                        test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=4)
-        err[i, 3] = np.abs(Plotter(data_in, data_out, *fcn).result()[0][i].item() / data_out[i].item() - 1)
-        # 全连接网络集成
-        # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-        #                  test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
-        # err[i, 4] = np.abs(Plotter(data_in, data_out, *fcn2).result()[0][i].item() / data_out[i].item() - 1)
-        # 去噪网络
-        dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-                       test_row=[i], net_args={'hidden_n': 15}, thread_n=4)
-        err[i, 5] = np.abs(Plotter(data_in, data_out, *dn).result()[0][i].item() / data_out[i].item() - 1)
-        # 去噪网络集成
-        # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
-        #                 test_row=[i], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
-        # err[i, 6] = np.abs(Plotter(data_in, data_out, *dn2).result()[0][i].item() / data_out[i].item() - 1)
-    print("Average error (LOO):", *err.mean(axis=0), sep='\n')
+        for j in range(10):  # j = 4
+            # 径向基函数网络
+            # n = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20]
+            # rbf = RBF(data_in_std[train_row].T, data_out[train_row])
+            # rbf.train(n=n[j])
+            # err[i, 0, j] = np.abs(rbf.regress(x_test).item() / data_out[i].item() - 1)
+            # 高斯过程回归（克里金）
+            # sigma = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2]  # 0.6
+            # gpr = GPR(data_in_std[train_row].T, data_out[train_row], sigma=sigma[j])
+            # err[i, 1, j] = np.abs(gpr.regress(x_test)[0].item() / data_out[i].item() - 1)
+            # 局部加权线性回归
+            # k = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]  # 0.5
+            # lwlr = CurveFitting(data_out.flatten()[train_row].tolist(), *data_in_std[train_row].T)
+            # lwlr.Regress(k=k[j], show=False)
+            # err[i, 2, j] = np.abs(lwlr.Estimate(x_test.flatten().tolist()) / data_out[i].item() - 1)
+            # 全连接网络
+            fcn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                            test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 28}, thread_n=4)
+            err[i, 3, j] = np.abs(Plotter(data_in, data_out, *fcn).result()[0][i].item() / data_out[i].item() - 1)
+            # 全连接网络集成
+            # fcn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+            #                  test_row=[i], net_args={'backbone': 'fc', 'hidden_n': 42}, thread_n=8, n_per_thread=16)
+            # err[i, 4, j] = np.abs(Plotter(data_in, data_out, *fcn2).result()[0][i].item() / data_out[i].item() - 1)
+            # 去噪网络
+            dn = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+                           test_row=[i], net_args={'hidden_n': 10}, thread_n=4)
+            err[i, 5, j] = np.abs(Plotter(data_in, data_out, *dn).result()[0][i].item() / data_out[i].item() - 1)
+            # 去噪网络集成
+            # dn2 = train_net(net_type=DenoiseWrapper, data_in=data_in, data_out=data_out,
+            #                 test_row=[i], net_args={'hidden_n': 15}, thread_n=8, n_per_thread=16)
+            # err[i, 6, j] = np.abs(Plotter(data_in, data_out, *dn2).result()[0][i].item() / data_out[i].item() - 1)
+    print("Minimum average error (LOO):", *np.nanmin(err.mean(axis=0), axis=-1), sep='\n')
 
     pass
 
@@ -2841,9 +2874,9 @@ def test_bagging():
 
 
 if __name__ == '__main__':
-    # test_compare()
+    test_compare()
     # test_compare_with_lwlr()
-    test_trainer()
+    # test_trainer()
     # test_arch_plot()
     # test_denoise_plot()
     # test_finetuner()
